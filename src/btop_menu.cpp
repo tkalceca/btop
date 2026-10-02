@@ -489,6 +489,16 @@ namespace Menu {
 					"\"Auto\" to show when no gpu box is shown.",
 					"\"On\" to always show.",
 					"\"Off\" to never show."},
+				{"show_npu_info",
+						"Show Intel NPU info in cpu box.",
+						"",
+						"Toggles NPU busy%/power/temp stats as a",
+						"brief row in the cpu box, below any gpu",
+						"rows.",
+						"",
+						"\"Auto\" to show when an NPU is detected.",
+						"\"On\" to always show.",
+						"\"Off\" to never show."},
 		#endif
 			{"check_temp",
 				"Enable cpu temperature reporting.",
@@ -605,6 +615,12 @@ namespace Menu {
 				"\"nvidia\", \"amd\", \"intel\",",
 				"and \"apple\".",
 				"Separate values with whitespace.",
+				"",
+				"A restart is required to apply changes."},
+			{"shown_npus",
+				"Manually set which NPU vendors to show.",
+				"",
+				"Available values are \"intel\".",
 				"",
 				"A restart is required to apply changes."},
 			{"custom_gpu_name0",
@@ -1333,6 +1349,7 @@ static int optionsMenu(const string& key) {
 			{"disable_presets", std::cref(Config::disable_preset_options)},
 		#ifdef GPU_SUPPORT
 			{"show_gpu_info", std::cref(Config::show_gpu_values)},
+			{"show_npu_info", std::cref(Config::show_gpu_values)},
 			{"graph_symbol_gpu", std::cref(Config::valid_graph_symbols_def)},
 		#endif
 		};
@@ -1573,7 +1590,7 @@ static int optionsMenu(const string& key) {
 					else if (option == "base_10_bitrate") {
 						recollect = true;
 					}
-					else if (is_in(option, "proc_sorting", "cpu_sensor", "show_gpu_info") or option.starts_with("graph_symbol") or option.starts_with("cpu_graph_"))
+					else if (is_in(option, "proc_sorting", "cpu_sensor", "show_gpu_info", "show_npu_info") or option.starts_with("graph_symbol") or option.starts_with("cpu_graph_"))
 						screen_redraw = true;
 					else if (option == "disable_presets" and optList.at(i) != "Off") {
 						atomic_wait(Runner::active);

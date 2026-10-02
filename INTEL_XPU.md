@@ -147,3 +147,32 @@ runtime via `dlopen`.
   dedicated hwmon power node. Not needed to fix the reported busy% bug; a nice-to-have
   for a future pass.
 - `Nvml`/`Rsmi`/`Asysfs` (NVIDIA/AMD) are unchanged — this pass is Intel-only.
+
+## Intel NPU monitoring (`Npu` namespace)
+
+Added alongside the GPU work, following the same pure-sysfs approach: a new `Npu`
+namespace in `src/linux/btop_collect.cpp` discovers Intel NPUs (`ivpu`/`intel_vpu`
+driver — Meteor Lake, Lunar Lake, Arrow Lake, Panther Lake, etc.) under
+`/sys/class/accel/accelN`, mirroring `xpu-top`'s `discover_npus()`/`NpuDev` model:
+
+- **Busy%**: `npu_busy_time_us` (microseconds, kernel 6.10+) delta-over-wall-time,
+  falling back to the coarser `power/runtime_active_time` (milliseconds, "device
+  resumed" rather than "jobs executing") on older kernels.
+- **Power**: same `power1_average` → `power1_input` → `energy1_input`-delta fallback
+  chain built for the GPU `Sysfs` tier, including the same empty-deque seeding
+  safeguard from day one (learned from the GPU crash above).
+- **Temp**: `hwmon/temp1_input`.
+
+This is intentionally **Phase 1 only**: brief one-line NPU rows in the CPU panel
+(`Cpu::draw`), stacked directly below the existing GPU brief rows, reusing
+`Gpu::gpu_info`/`gpu_info_supported` as-is (VRAM/PCIe/encode-decode fields stay
+`false` — not applicable; the NPU shares system RAM rather than having dedicated
+memory). New config: `shown_npus` (default `"intel"`) and `show_npu_info`
+(Auto/On/Off, default `Auto`), mirroring the GPU equivalents.
+
+**Explicitly deferred**: a dedicated `npuN` box/column (`shown_boxes` integration,
+mirroring `Gpu::draw()`'s per-device detail box) — real follow-up if Phase 1 proves
+useful, but most of that box's content (VRAM, PCIe, encode/decode) wouldn't apply to
+an NPU anyway. Also deferred: AMD Ryzen AI (`amdxdna`), which exposes utilization via
+a DRM ioctl rather than a plain sysfs busy-time file — separate work from what's here.
+

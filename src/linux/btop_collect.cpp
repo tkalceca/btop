@@ -400,6 +400,37 @@ namespace Gpu {
 	}
 }
 
+//? Intel NPU data collection (brief rows in the CPU panel only — no dedicated box).
+//? Reuses Gpu::gpu_info/gpu_info_supported since the drawing widgets (Meter, Graph)
+//? and most fields map directly; NPU just leaves mem_total/mem_used/pcie_txrx/
+//? encoder_utilization/decoder_utilization at their default false (not applicable —
+//? the NPU shares system RAM rather than having dedicated VRAM). See INTEL_XPU.md.
+namespace Npu {
+	struct device_paths {
+		std::filesystem::path dev;          //? .../accelN/device
+		std::filesystem::path accel;        //? .../accelN
+		std::filesystem::path hwmon;
+		std::filesystem::path busy_path;    //? npu_busy_time_us, or runtime_active_time fallback
+		bool busy_is_us = true;             //? false when using the coarser ms-granularity fallback
+		bool has_power = false;
+		long long prev_busy = -1;
+		long long prev_t_us = 0;
+		long long prev_energy_uj = -1;
+		long long prev_energy_t_us = 0;
+		uint32_t pci_device_id = 0;
+	};
+
+	bool initialized = false;
+	bool init();
+	bool shutdown();
+	void sample();
+	auto collect(bool no_update) -> vector<Gpu::gpu_info>&;
+	uint32_t device_count = 0;
+	vector<device_paths> devices;
+	vector<Gpu::gpu_info> npus;
+	vector<string> npu_names;
+}
+
 #endif // GPU_SUPPORT
 
 namespace Mem {
@@ -491,6 +522,11 @@ namespace Shared {
 			if (not Gpu::Intel::LevelZero::init())
 				if (not Gpu::Intel::Sysfs::init())
 					Gpu::Intel::init();
+		}
+
+		//? Init for namespace Npu (brief rows in the CPU panel only, see INTEL_XPU.md)
+		if (Config::getS("shown_npus").contains("intel")) {
+			Npu::init();
 		}
 
 		if (not Gpu::gpu_names.empty()) {
@@ -3156,6 +3192,257 @@ namespace Gpu {
 		return gpus;
 	}
 }
+
+namespace Npu {
+	int count = 0;
+
+	//? Match /sys/class/accel/accelN (no '-', all digits after "accel").
+	static bool is_accel_node(const string& fname) {
+		if (not fname.starts_with("accel") or fname.size() <= 5) return false;
+		return std::ranges::all_of(fname.begin() + 5, fname.end(),
+			[](char c) { return c >= '0' and c <= '9'; });
+	}
+
+	//? Read a sysfs node containing a single integer; return fallback on missing/parse error.
+	static long long read_ll(const std::filesystem::path& path, long long fallback = 0) {
+		try {
+			return std::stoll(readfile(path, std::to_string(fallback)));
+		} catch (const std::exception&) {
+			return fallback;
+		}
+	}
+
+	//? Pick the first hwmon* subdirectory under <device>/hwmon, or empty path if none.
+	static std::filesystem::path find_hwmon(const std::filesystem::path& device) {
+		const auto hwmon_dir = device / "hwmon";
+		std::error_code ec;
+		if (not std::filesystem::is_directory(hwmon_dir, ec)) return {};
+		for (const auto& h : std::filesystem::directory_iterator(hwmon_dir, ec)) {
+			if (h.is_directory()) return h.path();
+		}
+		return {};
+	}
+
+	bool init() {
+		if (initialized) return false;
+		devices.clear();
+		npus.clear();
+		npu_names.clear();
+
+		const std::filesystem::path accel_root("/sys/class/accel");
+		std::error_code ec;
+		if (not std::filesystem::is_directory(accel_root, ec)) {
+			Logger::debug("Intel NPU: /sys/class/accel not present");
+			return false;
+		}
+
+		for (const auto& entry : std::filesystem::directory_iterator(accel_root, ec)) {
+			if (not is_accel_node(entry.path().filename().string())) continue;
+
+			const auto dev = entry.path() / "device";
+			if (not std::filesystem::exists(dev)) continue;
+
+			//? Only Intel's ivpu driver (intel_vpu on older kernels, ivpu on 6.10+) is
+			//? supported for now — AMD's amdxdna exposes utilization via a DRM ioctl
+			//? rather than a plain sysfs busy-time file, which is separate work.
+			std::error_code dec;
+			const auto driver_link = std::filesystem::read_symlink(dev / "driver", dec);
+			if (dec) continue;
+			const string driver = driver_link.filename().string();
+			if (driver != "intel_vpu" and driver != "ivpu") continue;
+
+			device_paths d{};
+			d.dev = dev;
+			d.accel = entry.path();
+			d.hwmon = find_hwmon(dev);
+
+			for (const char* c : { "npu_busy_time_us", "npu_busy_time" }) {
+				if (std::filesystem::exists(d.accel / c)) { d.busy_path = d.accel / c; d.busy_is_us = true; break; }
+				if (std::filesystem::exists(d.dev / c)) { d.busy_path = d.dev / c; d.busy_is_us = true; break; }
+			}
+			if (d.busy_path.empty()) {
+				//? Runtime-PM fallback for kernels older than 6.10 (coarser: "device
+				//? resumed" time in milliseconds, not "jobs executing").
+				if (std::filesystem::exists(d.dev / "power" / "runtime_active_time")) {
+					d.busy_path = d.dev / "power" / "runtime_active_time";
+					d.busy_is_us = false;
+				} else if (std::filesystem::exists(d.accel / "power" / "runtime_active_time")) {
+					d.busy_path = d.accel / "power" / "runtime_active_time";
+					d.busy_is_us = false;
+				}
+			}
+
+			//? No busy-time counter at all means there's nothing this backend can report.
+			if (d.busy_path.empty()) {
+				Logger::debug("Intel NPU: skipping {} — no busy-time counter found", dev.string());
+				continue;
+			}
+
+			if (not d.hwmon.empty()) {
+				d.has_power = std::filesystem::exists(d.hwmon / "power1_average")
+					or std::filesystem::exists(d.hwmon / "power1_input")
+					or std::filesystem::exists(d.hwmon / "energy1_input");
+			}
+
+			try {
+				d.pci_device_id = (uint32_t)std::stoul(readfile(dev / "device", "0"), nullptr, 0);
+			} catch (const std::exception&) {
+				d.pci_device_id = 0;
+			}
+
+			//? Reuse the vendored Intel device-name lookup (same database the GPU
+			//? backends use) — pass the accel node's own directory, not
+			//? find_intel_gpu_dir() (which only ever returns the first Intel *GPU*
+			//? card and would misname/miss every NPU).
+			string name;
+			char *npu_device_id_c = get_intel_device_id(entry.path().c_str());
+			if (npu_device_id_c) {
+				char *npu_device_name_c = get_intel_device_name(npu_device_id_c);
+				if (npu_device_name_c) {
+					name = string(npu_device_name_c);
+					free(npu_device_name_c);
+				}
+				free(npu_device_id_c);
+			}
+			if (name.empty()) name = fmt::format("Intel NPU [{:04x}]", d.pci_device_id);
+
+			npu_names.push_back(std::move(name));
+			devices.push_back(std::move(d));
+		}
+
+		device_count = (uint32_t)devices.size();
+		if (device_count == 0) {
+			Logger::debug("Intel NPU: no Intel NPUs found");
+			return false;
+		}
+
+		npus.resize(device_count);
+		for (uint32_t i = 0; i < device_count; ++i) {
+			npus[i].supported_functions = {
+				.gpu_utilization = true,
+				.mem_utilization = false,
+				.gpu_clock = false,
+				.mem_clock = false,
+				.pwr_usage = devices[i].has_power,
+				.pwr_state = false,
+				.temp_info = not devices[i].hwmon.empty() and std::filesystem::exists(devices[i].hwmon / "temp1_input"),
+				.mem_total = false,
+				.mem_used = false,
+				.pcie_txrx = false,
+				.encoder_utilization = false,
+				.decoder_utilization = false,
+			};
+			npus[i].pwr_max_usage = 0;
+		}
+
+		initialized = true;
+		Logger::info("Using Intel NPU sysfs for {} NPU(s)", device_count);
+		sample(); //? seed first values so callers never see an empty deque
+		return true;
+	}
+
+	bool shutdown() {
+		if (not initialized) return false;
+		devices.clear();
+		npus.clear();
+		npu_names.clear();
+		device_count = 0;
+		initialized = false;
+		return true;
+	}
+
+	void sample() {
+		const long long t_us = get_monotonicTimeUSec();
+
+		for (uint32_t i = 0; i < device_count; ++i) {
+			auto& d = devices[i];
+			auto& npu = npus[i];
+
+			const long long raw = read_ll(d.busy_path, -1);
+			if (raw >= 0) {
+				if (d.prev_busy >= 0 and t_us > d.prev_t_us and raw >= d.prev_busy) {
+					const double dwall_us = (double)(t_us - d.prev_t_us);
+					const double dbusy_us = d.busy_is_us
+						? (double)(raw - d.prev_busy)
+						: (double)(raw - d.prev_busy) * 1000.0; //? ms -> us
+					if (dwall_us > 0) {
+						const double p = std::clamp(100.0 * dbusy_us / dwall_us, 0.0, 100.0);
+						npu.gpu_percent.at("gpu-totals").push_back((long long)std::round(p));
+					}
+				}
+				d.prev_busy = raw;
+				d.prev_t_us = t_us;
+			}
+			//? Seed so .back() is never called on an empty deque, whatever path above
+			//? did or didn't run this tick — same safeguard the GPU Sysfs tier needed.
+			if (npu.gpu_percent.at("gpu-totals").empty())
+				npu.gpu_percent.at("gpu-totals").push_back(0);
+
+			if (d.has_power) {
+				const auto avg_path = d.hwmon / "power1_average";
+				const auto inst_path = d.hwmon / "power1_input";
+				long long pw_uw = -1;
+				if (std::filesystem::exists(avg_path)) pw_uw = read_ll(avg_path, -1);
+				else if (std::filesystem::exists(inst_path)) pw_uw = read_ll(inst_path, -1);
+
+				if (pw_uw < 0) {
+					const auto energy_path = d.hwmon / "energy1_input";
+					if (std::filesystem::exists(energy_path)) {
+						const long long energy_uj = read_ll(energy_path, -1);
+						if (energy_uj >= 0) {
+							if (d.prev_energy_uj >= 0 and t_us > d.prev_energy_t_us and energy_uj >= d.prev_energy_uj) {
+								const double dt_s = (double)(t_us - d.prev_energy_t_us) / 1e6;
+								if (dt_s > 0) {
+									const double watts = (double)(energy_uj - d.prev_energy_uj) / 1e6 / dt_s;
+									pw_uw = (long long)std::round(watts * 1e6);
+								}
+							}
+							d.prev_energy_uj = energy_uj;
+							d.prev_energy_t_us = t_us;
+						}
+					}
+				}
+
+				if (pw_uw >= 0) {
+					npu.pwr_usage = pw_uw / 1000;
+					npu.pwr_max_usage = std::max(npu.pwr_max_usage, npu.pwr_usage);
+					if (npu.pwr_max_usage > 0) {
+						npu.gpu_percent.at("gpu-pwr-totals").push_back(
+							std::clamp((long long)std::round((double)npu.pwr_usage * 100.0 / (double)npu.pwr_max_usage), 0ll, 100ll));
+					}
+				}
+				if (npu.gpu_percent.at("gpu-pwr-totals").empty())
+					npu.gpu_percent.at("gpu-pwr-totals").push_back(0);
+			}
+
+			if (not d.hwmon.empty()) {
+				const auto temp_path = d.hwmon / "temp1_input";
+				if (std::filesystem::exists(temp_path)) {
+					npu.temp.push_back(read_ll(temp_path) / 1000); //? millidegrees -> degrees
+				}
+			}
+		}
+	}
+
+	auto collect(bool no_update) -> vector<Gpu::gpu_info>& {
+		if (Runner::stopping or (no_update and not npus.empty())) return npus;
+
+		sample();
+
+		//? No dedicated box exists for NPUs (brief rows only, see INTEL_XPU.md), so
+		//? there's no "width" to size against like Gpu does — cap growth at a
+		//? generous fixed size instead.
+		for (auto& npu : npus) {
+			while (cmp_greater(npu.gpu_percent.at("gpu-totals").size(), 500)) npu.gpu_percent.at("gpu-totals").pop_front();
+			while (cmp_greater(npu.gpu_percent.at("gpu-pwr-totals").size(), 500)) npu.gpu_percent.at("gpu-pwr-totals").pop_front();
+			while (cmp_greater(npu.temp.size(), 18)) npu.temp.pop_front();
+		}
+
+		count = npus.size();
+
+		return npus;
+	}
+}
 #endif
 
 /// Convert ascii escapes like \040 into chars.
@@ -3164,6 +3451,7 @@ static auto convert_ascii_escapes(const std::string& input) -> std::string {
     out.reserve(input.size());
 
     for (std::size_t i = 0; i < input.size(); ++i) {
+
         if (input[i] == '\\' &&
 	    	// Peek the next three characters.
             i + 3 < input.size() &&

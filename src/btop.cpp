@@ -234,6 +234,7 @@ void clean_quit(int sig) {
 	Gpu::Intel::LevelZero::shutdown();
 	Gpu::Intel::Sysfs::shutdown();
 	Gpu::Intel::shutdown();
+	Npu::shutdown();
 	#ifdef __APPLE__
 	Gpu::AppleSilicon::shutdown();
 	#endif
@@ -532,6 +533,17 @@ namespace Runner {
 					if (Global::debug) debug_timer("gpu", collect_done);
 				}
 				auto& gpus_ref = gpus;
+
+				//? Intel NPU data collection (brief rows in the CPU panel only, see INTEL_XPU.md)
+				const bool npu_in_cpu_panel = Config::getS("show_npu_info") != "Off";
+
+				vector<Gpu::gpu_info> npus;
+				if (npu_in_cpu_panel) {
+					if (Global::debug) debug_timer("npu", collect_begin);
+					npus = Npu::collect(conf.no_update);
+					if (Global::debug) debug_timer("npu", collect_done);
+				}
+				auto& npus_ref = npus;
 #endif // GPU_SUPPORT
 
 				//? CPU
@@ -558,6 +570,7 @@ namespace Runner {
 								cpu,
 #if defined(GPU_SUPPORT)
 								gpus_ref,
+								npus_ref,
 #endif // GPU_SUPPORT
 								conf.force_redraw,
 								conf.no_update

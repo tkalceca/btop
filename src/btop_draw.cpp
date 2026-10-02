@@ -563,11 +563,14 @@ namespace Cpu {
 	vector<Draw::Graph> temp_graphs;
 	vector<Draw::Graph> gpu_temp_graphs;
 	vector<Draw::Graph> gpu_mem_graphs;
+	vector<Draw::Meter> npu_meters;
+	vector<Draw::Graph> npu_temp_graphs;
 
     string draw(
 		const cpu_info& cpu,
 #if defined(GPU_SUPPORT)
 		const vector<Gpu::gpu_info>& gpus,
+		const vector<Gpu::gpu_info>& npus,
 #endif // GPU_SUPPORT
 		bool force_redraw,
 		bool data_same
@@ -584,6 +587,10 @@ namespace Cpu {
 		const bool gpu_always = show_gpu_info == "On";
 		const bool gpu_auto = show_gpu_info == "Auto";
 		const bool show_gpu = (gpus.size() > 0 and (gpu_always or (gpu_auto and Gpu::shown < Gpu::count)));
+		//? NPUs have no dedicated box in this pass (see INTEL_XPU.md), so unlike show_gpu
+		//? there's no "already shown in its own box" case to subtract — Auto and On both
+		//? just mean "show whenever at least one NPU was detected".
+		const bool show_npu = (npus.size() > 0 and Config::getS("show_npu_info") != "Off");
 #endif // GPU_SUPPORT
 		auto graph_up_field = Config::getS("cpu_graph_upper");
 		if (graph_up_field == "Auto" or not v_contains(Cpu::available_fields, graph_up_field))
@@ -725,6 +732,28 @@ namespace Cpu {
 					width_left -= (gpu.supported_functions.pwr_usage ? 6 : 0);
 					if (gpu.supported_functions.gpu_utilization) {
 						gpu_meters[i] = Draw::Meter{width_left, "cpu" };
+					}
+				}
+			}
+
+			//? NPU brief-row graphs/meters — no dedicated box, so no shown_panels skip.
+			if (show_npu and b_columns > 1) {
+				npu_temp_graphs.resize(npus.size());
+				npu_meters.resize(npus.size());
+
+				auto npu_graph_width = b_width < 42 ? 4 : 5;
+
+				for (size_t i = 0; i < npus.size(); i++) {
+					auto& npu = npus[i];
+
+					auto width_left = b_width - 10 - (npus.size() > 9 ? 2 : npus.size() > 1 ? 1 : 0);
+					if (npu.supported_functions.temp_info and show_temps) {
+						npu_temp_graphs[i] = Draw::Graph{ npu_graph_width, 1, "temp", npu.temp, graph_symbol, false, false, npu.temp_max, -23 };
+						width_left -= 11;
+					}
+					width_left -= (npu.supported_functions.pwr_usage ? 6 : 0);
+					if (npu.supported_functions.gpu_utilization) {
+						npu_meters[i] = Draw::Meter{width_left, "cpu" };
 					}
 				}
 			}
@@ -899,10 +928,13 @@ namespace Cpu {
 
 		int max_row = b_height - 3; // Subtracting one extra row for the load average (and power if enabled)
 		int n_gpus_to_show = 0;
+		int n_npus_to_show = 0;
 	#ifdef GPU_SUPPORT
 		n_gpus_to_show = show_gpu ? (gpus.size() - (gpu_always ? 0 : Gpu::shown)) : 0;
+		n_npus_to_show = show_npu ? npus.size() : 0;
 	#endif
 		max_row -= n_gpus_to_show;
+		max_row -= n_npus_to_show;
 
 		auto is_cpu_enabled = [&cpu](const std::int32_t num) -> bool {
 			return !cpu.active_cpus.has_value() || std::ranges::find(cpu.active_cpus.value(), num) != cpu.active_cpus.value().end();
@@ -959,7 +991,7 @@ namespace Cpu {
 
 		//? Load average
 		if (cy < b_height - 1 and cc <= b_columns) {
-			cy = b_height - 2 - n_gpus_to_show;
+			cy = b_height - 2 - n_gpus_to_show - n_npus_to_show;
 
 			string load_avg_pre = "Load avg:";
 			string load_avg;
@@ -1013,6 +1045,41 @@ namespace Cpu {
 				if (gpus[i].supported_functions.pwr_usage) {
 					out += ' ' + Theme::g("cached").at(clamp(safeVal(gpus[i].gpu_percent, "gpu-pwr-totals"s).back(), 0ll, 100ll))
 						+ fmt::format("{:>4.{}f}", gpus[i].pwr_usage / 1000.0, gpus[i].pwr_usage < 10'000 ? 2 : gpus[i].pwr_usage < 100'000 ? 1 : 0) + Theme::c("main_fg") + 'W';
+				}
+
+				if (cy > b_height - 1) break;
+			}
+		}
+
+		//? NPU brief info — same style as the GPU rows above, stacked directly below
+		//? them. No VRAM section: NPUs share system RAM rather than having dedicated
+		//? memory, so that part of the GPU row simply doesn't apply. See INTEL_XPU.md.
+		if (show_npu) {
+			for (unsigned long i = 0; i < npus.size(); ++i) {
+				out += Mv::to(b_y + ++cy, b_x + 1) + Theme::c("main_fg") + Fx::b + "NPU";
+				if (npus.size() > 1) out += rjust(to_string(i), 1 + (npus.size() > 9));
+				if (npus[i].supported_functions.gpu_utilization) {
+					out += ' ';
+					if (b_columns > 1) {
+					out += npu_meters[i](safeVal(npus[i].gpu_percent, "gpu-totals"s).back())
+						+ Theme::g("cpu").at(clamp(safeVal(npus[i].gpu_percent, "gpu-totals"s).back(), 0ll, 100ll));
+					}
+					out += rjust(to_string(safeVal(npus[i].gpu_percent, "gpu-totals"s).back()), 3) + Theme::c("main_fg") + '%';
+					if (b_columns == 1)
+						out += ' ';
+				}
+				if (show_temps and npus[i].supported_functions.temp_info) {
+					const auto [temp, unit] = celsius_to(npus[i].temp.back(), temp_scale);
+					out += ' ';
+					if (b_columns > 1)
+						out += Theme::c("inactive_fg") + graph_bg * 5 + Mv::l(5) + Theme::g("temp").at(clamp(npus[i].temp.back() * 100 / npus[i].temp_max, 0ll, 100ll))
+							+ npu_temp_graphs[i](npus[i].temp, data_same or redraw);
+					else out += Theme::g("temp").at(clamp(npus[i].temp.back() * 100 / npus[i].temp_max, 0ll, 100ll));
+					out += rjust(to_string(temp), 3) + Theme::c("main_fg") + unit;
+				}
+				if (npus[i].supported_functions.pwr_usage) {
+					out += ' ' + Theme::g("cached").at(clamp(safeVal(npus[i].gpu_percent, "gpu-pwr-totals"s).back(), 0ll, 100ll))
+						+ fmt::format("{:>4.{}f}", npus[i].pwr_usage / 1000.0, npus[i].pwr_usage < 10'000 ? 2 : npus[i].pwr_usage < 100'000 ? 1 : 0) + Theme::c("main_fg") + 'W';
 				}
 
 				if (cy > b_height - 1) break;
@@ -2312,16 +2379,20 @@ namespace Draw {
 				Config::getS("show_gpu_info") == "On" ? Gpu::count
 				: Config::getS("show_gpu_info") == "Auto" ? Gpu::count - Gpu::shown
 				: 0;
+			// inline NPU information — no dedicated box exists for NPUs (see
+			// INTEL_XPU.md), so unlike gpus_extra_height there's no "- Gpu::shown"
+			// term to subtract: Auto and On both just reserve one row per NPU.
+			int npus_extra_height = Config::getS("show_npu_info") != "Off" ? Npu::count : 0;
 		#endif
             const bool show_temp = (Config::getB("check_temp") and got_sensors);
 			width = round((double)Term::width * width_p / 100);
 		#ifdef GPU_SUPPORT
 			if (Gpu::shown != 0 and not (Mem::shown or Net::shown or Proc::shown)) {
-				height = Term::height - Gpu::total_height - gpus_extra_height;
+				height = Term::height - Gpu::total_height - gpus_extra_height - npus_extra_height;
 			} else {
 				height = max(8, (int)ceil((double)Term::height * (trim(boxes) == "cpu" ? 100 : height_p/(Gpu::shown+1) + (Gpu::shown != 0)*5) / 100));
 			}
-			if (height <= Term::height-gpus_extra_height) height += gpus_extra_height;
+			if (height <= Term::height-gpus_extra_height-npus_extra_height) height += gpus_extra_height + npus_extra_height;
 		#else
 			height = max(8, (int)ceil((double)Term::height * (trim(boxes) == "cpu" ? 100 : height_p) / 100));
 		#endif
@@ -2329,7 +2400,7 @@ namespace Draw {
 			y = cpu_bottom ? Term::height - height + 1 : 1;
 
 		#ifdef GPU_SUPPORT
-			b_columns = max(2, (int)ceil((double)(Shared::coreCount + 1) / (height - gpus_extra_height - 5)));
+			b_columns = max(2, (int)ceil((double)(Shared::coreCount + 1) / (height - gpus_extra_height - npus_extra_height - 5)));
 		#else
 			b_columns = max(1, (int)ceil((double)(Shared::coreCount + 1) / (height - 5)));
 		#endif
@@ -2352,7 +2423,7 @@ namespace Draw {
 			if (b_column_size == 0) b_width = (8 + 6 * show_temp) * b_columns + 1;
 		#ifdef GPU_SUPPORT
 			//gpus_extra_height = max(0, gpus_extra_height - 1);
-			b_height = min(height - 2, (int)ceil((double)Shared::coreCount / b_columns) + 4 + gpus_extra_height);
+			b_height = min(height - 2, (int)ceil((double)Shared::coreCount / b_columns) + 4 + gpus_extra_height + npus_extra_height);
 		#else
 			b_height = min(height - 2, (int)ceil((double)Shared::coreCount / b_columns) + 4);
 		#endif

@@ -212,6 +212,17 @@ namespace Gpu {
   	string draw(const gpu_info& gpu, unsigned long index, bool force_redraw, bool data_same);
 }
 
+//* Intel NPU monitoring: brief rows in the CPU panel only, no dedicated box.
+//* Reuses Gpu::gpu_info since the drawing widgets and most fields map directly.
+//* See INTEL_XPU.md.
+namespace Npu {
+	extern int count;
+
+	bool init();
+	bool shutdown();
+	auto collect(bool no_update = false) -> vector<Gpu::gpu_info>&;
+}
+
 #endif // GPU_SUPPORT
 
 namespace Cpu {
@@ -254,6 +265,7 @@ namespace Cpu {
 		const cpu_info& cpu,
 #if defined(GPU_SUPPORT)
 		const vector<Gpu::gpu_info>& gpu,
+		const vector<Gpu::gpu_info>& npu,
 #endif
 		bool force_redraw = false,
 		bool data_same = false
