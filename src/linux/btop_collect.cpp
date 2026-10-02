@@ -322,6 +322,12 @@ namespace Gpu {
 				std::filesystem::path hwmon;
 				vector<GtNode> gts;
 				uint32_t pci_device_id = 0;
+				//? True only if an actual power source file was found under hwmon (not just
+				//? the hwmon directory itself) — this, not hwmon presence, is what guarantees
+				//? "gpu-pwr-totals" gets populated. See collect() below.
+				bool has_power = false;
+				long long prev_energy_uj = -1;
+				long long prev_energy_t_us = 0;
 			};
 
 			bool initialized = false;
@@ -2250,6 +2256,13 @@ namespace Gpu {
 					d.pci_device_id = 0;
 				}
 				d.hwmon = find_hwmon(device_link);
+				if (not d.hwmon.empty()) {
+					//? Only an actual power source file, not merely the hwmon directory,
+					//? guarantees collect() below will have something to report every tick.
+					d.has_power = std::filesystem::exists(d.hwmon / "power1_average")
+						or std::filesystem::exists(d.hwmon / "power1_input")
+						or std::filesystem::exists(d.hwmon / "energy1_input");
+				}
 				discover_gts(device_link, driver, d.gts);
 
 				//? No residency counters on this card means there's nothing this backend can
@@ -2325,7 +2338,7 @@ namespace Gpu {
 						.mem_utilization = false,
 						.gpu_clock = have_freq_path,
 						.mem_clock = false,
-						.pwr_usage = not d.hwmon.empty(),
+						.pwr_usage = d.has_power,
 						.pwr_state = false,
 						.temp_info = not d.hwmon.empty() and std::filesystem::exists(d.hwmon / "temp1_input"),
 						.mem_total = false, //? Intel has no simple universal sysfs VRAM node; deferred, see INTEL_XPU.md
@@ -2379,12 +2392,33 @@ namespace Gpu {
 					gpu.gpu_clock_speed = (unsigned int)std::round(act_sum / act_cnt);
 				}
 
-				if (not d.hwmon.empty()) {
+				if (d.has_power) {
 					const auto avg_path = d.hwmon / "power1_average";
 					const auto inst_path = d.hwmon / "power1_input";
 					long long pw_uw = -1;
 					if (std::filesystem::exists(avg_path)) pw_uw = read_ll(avg_path, -1);
 					else if (std::filesystem::exists(inst_path)) pw_uw = read_ll(inst_path, -1);
+
+					if (pw_uw < 0) {
+						//? Neither instantaneous power file worked (or exists) — fall back to
+						//? an energy-counter delta, the same technique xpu-top uses for cards
+						//? exposing only energy1_input (cumulative microjoules, monotonic).
+						const auto energy_path = d.hwmon / "energy1_input";
+						if (std::filesystem::exists(energy_path)) {
+							const long long energy_uj = read_ll(energy_path, -1);
+							if (energy_uj >= 0) {
+								if (d.prev_energy_uj >= 0 and t_us > d.prev_energy_t_us and energy_uj >= d.prev_energy_uj) {
+									const double dt_s = (double)(t_us - d.prev_energy_t_us) / 1e6;
+									if (dt_s > 0) {
+										const double watts = (double)(energy_uj - d.prev_energy_uj) / 1e6 / dt_s; //? uJ/s -> W
+										pw_uw = (long long)std::round(watts * 1e6); //? back to uW so the logic below stays uniform
+									}
+								}
+								d.prev_energy_uj = energy_uj;
+								d.prev_energy_t_us = t_us;
+							}
+						}
+					}
 
 					if (pw_uw >= 0) {
 						gpu.pwr_usage = pw_uw / 1000; //? microwatts -> milliwatts
@@ -2403,9 +2437,23 @@ namespace Gpu {
 						if (gpu.pwr_max_usage > 0) {
 							gpu.gpu_percent.at("gpu-pwr-totals").push_back(
 								std::clamp((long long)std::round((double)gpu.pwr_usage * 100.0 / (double)gpu.pwr_max_usage), 0ll, 100ll));
+						} else if constexpr (is_init) {
+							//? Seed the graph even when we can't yet establish a scale (e.g. the
+							//? very first sample reads 0) — guarantees the deque is never left
+							//? empty while supported_functions.pwr_usage claims otherwise. This
+							//? is the fix for the crash in Cpu::draw()'s .back() on an empty
+							//? "gpu-pwr-totals" deque — see INTEL_XPU.md.
+							gpu.gpu_percent.at("gpu-pwr-totals").push_back(0);
 						}
+					} else if constexpr (is_init) {
+						//? No usable reading at all yet (e.g. energy1_input needs a second
+						//? sample to compute a delta) — seed anyway so the deque is never
+						//? left empty.
+						gpu.gpu_percent.at("gpu-pwr-totals").push_back(0);
 					}
+				}
 
+				if (not d.hwmon.empty()) {
 					const auto temp_path = d.hwmon / "temp1_input";
 					if (std::filesystem::exists(temp_path)) {
 						gpu.temp.push_back(read_ll(temp_path) / 1000); //? millidegrees -> degrees

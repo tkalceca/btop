@@ -81,9 +81,41 @@ existing `Nvml` (`libnvidia-ml.so`) and `Rsmi` (`librocm_smi64.so`) backends alr
 do — always compiled in, gracefully skipped if the library isn't present.
 
 It also sets `ZES_ENABLE_SYSMAN=1` (without clobbering a user's own setting) before
-calling `zesInit`, which the Level Zero Sysman API requires — this was missing
-entirely before, meaning the Level Zero backend could silently enumerate zero drivers
-even when the library was correctly installed and linked.
+calling `zesInit`, for compatibility with older loader versions that relied on it.
+**Correction/update**: the current upstream Level Zero specification documents this
+environment variable as the *deprecated* initialization method — `zesInit()` itself is
+the current, correct, and sufficient call (no `zeInit()` call is required before or
+after it). Setting the variable is a harmless no-op on current loaders, kept only for
+backward compatibility; it is not what makes `zesInit()` succeed or fail. A `zesInit()`
+failure (e.g. `ZE_RESULT_ERROR_UNINITIALIZED`) on a real system most commonly means no
+Sysman-capable GPU backend/ICD was discoverable by the loader at that moment (missing
+`intel-level-zero-gpu`/`libze-intel-gpu1` or equivalent, insufficient permissions on
+the render node, etc.) — in which case this tier correctly falls back to `Sysfs`.
+
+## Fixed: crash in `Gpu::Intel::Sysfs` when a card's power source is absent/unreadable
+
+The initial version of `Gpu::Intel::Sysfs` set `supported_functions.pwr_usage` from
+whether an `hwmon*` **directory** existed for the card, while the code that actually
+populates `gpu_percent["gpu-pwr-totals"]` required a successfully-read, positive power
+value. On a card whose `hwmon` directory exists but whose `power1_average`/
+`power1_input` files are missing, unreadable, or read as non-positive on every sample
+(observed on real hardware: a VM/virtualized Intel GPU with a stub hwmon node and no
+real power sensor), the flag was `true` while the deque stayed **permanently empty**.
+`Cpu::draw()` trusts that invariant unconditionally and calls `.back()` on it —
+undefined behavior (plain segfault in a release build) or an assertion abort (in a
+`_GLIBCXX_ASSERTIONS`-enabled debug build, which is what actually surfaced it).
+
+Fixed by:
+- Deriving `supported_functions.pwr_usage` from whether a power source **file** (not
+  just the hwmon directory) actually exists: `power1_average`, `power1_input`, or
+  `energy1_input`.
+- Adding an `energy1_input`-based wattage fallback (cumulative microjoules, delta over
+  wall time — same technique `xpu-top` uses) for cards that expose only an energy
+  counter, so more real hardware gets genuine wattage instead of "unsupported".
+- Seeding `"gpu-pwr-totals"` with `0` during `is_init` in every code path that doesn't
+  produce a usable reading, guaranteeing the deque can never be empty whenever
+  `supported_functions.pwr_usage` is `true` — mirroring the safeguard already in place
+  for `"gpu-totals"`.
 
 ## Build requirements
 
