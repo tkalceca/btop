@@ -599,8 +599,10 @@ namespace Cpu {
 		if (graph_lo_field == "Auto" or not v_contains(Cpu::available_fields, graph_lo_field)) {
 		#ifdef GPU_SUPPORT
 			//? "gpu-totals" also covers NPUs (they store busy% under the same key,
-			//? since Npu::npus reuses Gpu::gpu_info) — see INTEL_XPU.md.
-			graph_lo_field = (show_gpu or show_npu) ? "gpu-totals" : graph_up_field;
+			//? since Npu::npus reuses Gpu::gpu_info) — see INTEL_XPU.md. Label it
+			//? "xpu-totals" only when an NPU is actually part of the mix, so the
+			//? name stays accurate on GPU-only machines.
+			graph_lo_field = (show_gpu or show_npu) ? (Npu::count > 0 ? "xpu-totals" : "gpu-totals") : graph_up_field;
 		#else
 			graph_lo_field = graph_up_field;
 		#endif

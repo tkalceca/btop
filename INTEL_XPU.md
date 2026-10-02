@@ -205,3 +205,10 @@ the user actually picked. `"gpu-totals"` keeps working exactly as before; `"xpu-
 is just a clearer name for anyone who finds it more accurate now that NPUs can join
 the same split.
 
+`cpu_graph_lower`'s `"Auto"` resolution picks between the two automatically: it
+resolves to `"xpu-totals"` only when an NPU is actually detected (`Npu::count > 0`),
+and stays `"gpu-totals"` on GPU-only machines — so the default label is always
+accurate to what's actually being combined, with no manual menu action needed either
+way. Explicitly selecting either value manually always overrides this and is
+respected as picked.
+
