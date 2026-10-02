@@ -74,6 +74,12 @@ extern "C" {
 	#if defined(__clang__)
 		#pragma clang diagnostic pop
 	#endif // __clang__
+
+	//? Level Zero Sysman headers, for struct/enum definitions only — the actual library is
+	//? dlopen'd at runtime (see Gpu::Intel::LevelZero::init()), so this is a build-time-only
+	//? dependency, same trade-off Rsmi already accepts for <rocm_smi/rocm_smi.h>. See
+	//? INTEL_XPU.md for the package needed on each distro.
+	#include <level_zero/zes_api.h>
 #endif
 
 using std::abs;
@@ -284,6 +290,8 @@ namespace Gpu {
 
 
 	//? Intel data collection
+	//? Three backends are tried in order at startup (Shared::init), richest/most-permission-
+	//? free first: LevelZero -> Sysfs -> this legacy PMU backend. See INTEL_XPU.md for why.
 	namespace Intel {
 		const char* device = "i915";
 		struct engines *engines = nullptr;
@@ -293,6 +301,73 @@ namespace Gpu {
 		bool shutdown();
 		template <bool is_init> bool collect(gpu_info* gpus_slice);
 		uint32_t device_count = 0;
+
+		//? GT RC6/idle-residency based busy% — correct on Xe-architecture GPUs where the
+		//? legacy PMU per-engine "busy" counters above undercount GPU occupancy when a single
+		//? workload is split across multiple parallel engine instances. Pure sysfs, no
+		//? perf_event_open/CAP_PERFMON permissions needed. See INTEL_XPU.md.
+		namespace Sysfs {
+			struct GtNode {
+				string label;
+				std::filesystem::path residency_path;
+				std::filesystem::path freq_act_path;
+				std::filesystem::path freq_cur_path;
+				std::filesystem::path freq_max_path;
+				long long prev_res_ms = -1;
+				long long prev_t_us = 0;
+			};
+
+			struct device_paths {
+				std::filesystem::path dev;    //? .../cardN/device
+				std::filesystem::path hwmon;
+				vector<GtNode> gts;
+				uint32_t pci_device_id = 0;
+			};
+
+			bool initialized = false;
+			bool init();
+			bool shutdown();
+			template <bool is_init> bool collect(gpu_info* gpus_slice);
+			uint32_t device_count = 0;
+			vector<device_paths> devices;
+		}
+
+		//? Level Zero Sysman — richest telemetry (accurate VRAM, true per-engine activity)
+		//? when libze_loader is present on the system; dlopen'd at runtime, so this is
+		//? gracefully skipped if it isn't installed. See INTEL_XPU.md.
+		namespace LevelZero {
+			struct engine_info {
+				zes_engine_handle_t handle;
+				zes_engine_group_t type;
+				zes_engine_stats_t stats;
+			};
+
+			struct memory_info {
+				zes_mem_handle_t handle;
+				uint64_t physical_size;
+				uint64_t size;
+				uint64_t free;
+			};
+
+			struct XeDeviceState {
+				zes_device_handle_t device = nullptr;
+				vector<engine_info> engines;
+				vector<memory_info> memory_modules;
+				zes_pwr_handle_t power_handle = nullptr;
+				zes_power_energy_counter_t power_stats{};
+				long long power_limit = 0;
+				zes_freq_handle_t frequency_handle = nullptr;
+				bool initialized = false;
+			};
+
+			vector<XeDeviceState> device_states;
+			bool initialized = false;
+			bool init();
+			bool shutdown();
+			template <bool is_init> bool collect(gpu_info* gpus_slice);
+			uint32_t device_count = 0;
+			void* ze_dl_handle = nullptr;
+		}
 	}
 
 	//? AMD sysfs (consumer GPU / iGPU) data collection — fallback when amd-smi/rocm-smi
@@ -402,7 +477,14 @@ namespace Shared {
 		}
 
 		if (shown_gpus.contains("intel")) {
-			Gpu::Intel::init();
+			//? Prefer the richest/most-reliable backend available at runtime, falling back in
+			//? order: Level Zero (richest telemetry, needs libze_loader) -> Sysfs (GT
+			//? RC6-residency, always available on a modern i915/xe kernel, no special
+			//? permissions) -> legacy PMU (last resort; undercounts busy% on Xe-architecture
+			//? GPUs that split a workload across multiple engine instances). See INTEL_XPU.md.
+			if (not Gpu::Intel::LevelZero::init())
+				if (not Gpu::Intel::Sysfs::init())
+					Gpu::Intel::init();
 		}
 
 		if (not Gpu::gpu_names.empty()) {
@@ -2026,6 +2108,759 @@ namespace Gpu {
 		}
 	}
 
+	namespace Intel::Sysfs {
+		//? Read a sysfs node containing a single integer; return fallback on missing/parse error.
+		static long long read_ll(const std::filesystem::path& path, long long fallback = 0) {
+			try {
+				return std::stoll(readfile(path, std::to_string(fallback)));
+			} catch (const std::exception&) {
+				return fallback;
+			}
+		}
+
+		//? Match /sys/class/drm/cardN (no '-', all digits after "card"). Skips card1-DP-1, renderD*, etc.
+		static bool is_card_node(const string& fname) {
+			if (not fname.starts_with("card") or fname.size() <= 4) return false;
+			return std::ranges::all_of(fname.begin() + 4, fname.end(),
+				[](char c) { return c >= '0' and c <= '9'; });
+		}
+
+		//? Pick the first hwmon* subdirectory under <device>/hwmon, or empty path if none.
+		static std::filesystem::path find_hwmon(const std::filesystem::path& device) {
+			const auto hwmon_dir = device / "hwmon";
+			std::error_code ec;
+			if (not std::filesystem::is_directory(hwmon_dir, ec)) return {};
+			for (const auto& h : std::filesystem::directory_iterator(hwmon_dir, ec)) {
+				if (h.is_directory()) return h.path();
+			}
+			return {};
+		}
+
+		//? Discover GT residency nodes for a single card: try the xe layout first, then
+		//? i915's multi-GT layout (Meteor Lake+), then i915's legacy single-GT layout.
+		static void discover_gts(const std::filesystem::path& dev, const string& driver, vector<GtNode>& out) {
+			std::error_code ec;
+
+			if (driver == "xe") {
+				for (const auto& tentry : std::filesystem::directory_iterator(dev, ec)) {
+					if (ec) break;
+					const string tname = tentry.path().filename().string();
+					if (not tname.starts_with("tile")) continue;
+					std::error_code gec;
+					for (const auto& gentry : std::filesystem::directory_iterator(tentry.path(), gec)) {
+						const string gname = gentry.path().filename().string();
+						if (not gname.starts_with("gt")) continue;
+						const auto gpath = gentry.path();
+						const auto res = gpath / "gtidle" / "idle_residency_ms";
+						if (not std::filesystem::exists(res)) continue;
+
+						GtNode gt;
+						gt.label = tname + "/" + gname;
+						gt.residency_path = res;
+						if (std::filesystem::exists(gpath / "freq0" / "act_freq")) gt.freq_act_path = gpath / "freq0" / "act_freq";
+						if (std::filesystem::exists(gpath / "freq0" / "cur_freq")) gt.freq_cur_path = gpath / "freq0" / "cur_freq";
+						if (std::filesystem::exists(gpath / "freq0" / "rp0_freq")) gt.freq_max_path = gpath / "freq0" / "rp0_freq";
+						else if (std::filesystem::exists(gpath / "freq0" / "max_freq")) gt.freq_max_path = gpath / "freq0" / "max_freq";
+						out.push_back(std::move(gt));
+					}
+				}
+				return;
+			}
+
+			if (driver == "i915") {
+				const auto card = dev.parent_path(); //? dev == <card>/device, so card == dev.parent_path()
+				const auto gtdir = card / "gt";
+				if (std::filesystem::is_directory(gtdir, ec)) {
+					for (const auto& gentry : std::filesystem::directory_iterator(gtdir, ec)) {
+						const string gname = gentry.path().filename().string();
+						if (not gname.starts_with("gt")) continue;
+						const auto gpath = gentry.path();
+						const auto res = gpath / "rc6_residency_ms";
+						if (not std::filesystem::exists(res)) continue;
+
+						GtNode gt;
+						gt.label = gname;
+						gt.residency_path = res;
+						if (std::filesystem::exists(gpath / "rps_act_freq_mhz")) gt.freq_act_path = gpath / "rps_act_freq_mhz";
+						if (std::filesystem::exists(gpath / "rps_cur_freq_mhz")) gt.freq_cur_path = gpath / "rps_cur_freq_mhz";
+						if (std::filesystem::exists(gpath / "rps_RP0_freq_mhz")) gt.freq_max_path = gpath / "rps_RP0_freq_mhz";
+						else if (std::filesystem::exists(gpath / "rps_max_freq_mhz")) gt.freq_max_path = gpath / "rps_max_freq_mhz";
+						out.push_back(std::move(gt));
+					}
+				}
+
+				//? Single-GT / older i915: card-level legacy attributes, only if the per-GT
+				//? directory above yielded nothing.
+				if (out.empty()) {
+					const auto res = card / "power" / "rc6_residency_ms";
+					if (std::filesystem::exists(res)) {
+						GtNode gt;
+						gt.label = "gt0";
+						gt.residency_path = res;
+						if (std::filesystem::exists(card / "gt_act_freq_mhz")) gt.freq_act_path = card / "gt_act_freq_mhz";
+						if (std::filesystem::exists(card / "gt_cur_freq_mhz")) gt.freq_cur_path = card / "gt_cur_freq_mhz";
+						if (std::filesystem::exists(card / "gt_RP0_freq_mhz")) gt.freq_max_path = card / "gt_RP0_freq_mhz";
+						else if (std::filesystem::exists(card / "gt_max_freq_mhz")) gt.freq_max_path = card / "gt_max_freq_mhz";
+						out.push_back(std::move(gt));
+					}
+				}
+			}
+		}
+
+		bool init() {
+			if (initialized) return false;
+			devices.clear();
+
+			const std::filesystem::path drm_root("/sys/class/drm");
+			std::error_code ec;
+			if (not std::filesystem::is_directory(drm_root, ec)) {
+				Logger::debug("Intel sysfs: /sys/class/drm not present");
+				return false;
+			}
+
+			vector<string> device_names;
+
+			for (const auto& entry : std::filesystem::directory_iterator(drm_root, ec)) {
+				if (not is_card_node(entry.path().filename().string())) continue;
+
+				const auto device_link = entry.path() / "device";
+				if (not std::filesystem::exists(device_link)) continue;
+
+				//? Vendor must be exactly 0x8086 (Intel). The sysfs node ends with a newline,
+				//? so trim before comparing.
+				string vendor = readfile(device_link / "vendor", "");
+				while (not vendor.empty() and (vendor.back() == '\n' or vendor.back() == ' ')) vendor.pop_back();
+				if (vendor != "0x8086") continue;
+
+				//? Dynamically detect the bound driver (i915 or xe) instead of assuming one —
+				//? this is the fix for GPUs the legacy PMU backend above can't see at all
+				//? because it hardcodes "i915".
+				std::error_code dec;
+				const auto driver_link = std::filesystem::read_symlink(device_link / "driver", dec);
+				if (dec) continue;
+				const string driver = driver_link.filename().string();
+				if (driver != "i915" and driver != "xe") continue;
+
+				device_paths d{};
+				d.dev = device_link;
+				try {
+					//? "device" file holds e.g. "0x56a0\n" — base 0 lets stoul autodetect the 0x prefix.
+					d.pci_device_id = (uint32_t)std::stoul(readfile(device_link / "device", "0"), nullptr, 0);
+				} catch (const std::exception&) {
+					d.pci_device_id = 0;
+				}
+				d.hwmon = find_hwmon(device_link);
+				discover_gts(device_link, driver, d.gts);
+
+				//? No residency counters on this card means there's nothing this backend can
+				//? report for it — let the next tier (legacy PMU) have a shot instead.
+				if (d.gts.empty()) {
+					Logger::debug("Intel sysfs: skipping {} — no GT residency counters found", device_link.string());
+					continue;
+				}
+
+				//? Reuse the vendored Intel device-name lookup (same database the legacy PMU
+				//? backend uses below) so naming stays consistent across backends. Pass this
+				//? card's own directory (not find_intel_gpu_dir(), which only ever returns the
+				//? first Intel card found and would misname every GPU past the first).
+				string name;
+				char *gpu_device_id_c = get_intel_device_id(entry.path().c_str());
+				if (gpu_device_id_c) {
+					char *gpu_device_name_c = get_intel_device_name(gpu_device_id_c);
+					if (gpu_device_name_c) {
+						name = string(gpu_device_name_c);
+						free(gpu_device_name_c);
+					}
+					free(gpu_device_id_c);
+				}
+				if (name.empty()) name = fmt::format("Intel GPU [{:04x}]", d.pci_device_id);
+
+				device_names.push_back(std::move(name));
+				devices.push_back(std::move(d));
+			}
+
+			device_count = (uint32_t)devices.size();
+			if (device_count == 0) {
+				Logger::debug("Intel sysfs: no Intel GPUs with GT residency counters found");
+				return false;
+			}
+
+			gpus.resize(gpus.size() + device_count);
+			gpu_names.resize(Nvml::device_count + Rsmi::device_count + Asysfs::device_count + device_count);
+			for (uint32_t i = 0; i < device_count; ++i) {
+				gpu_names[Nvml::device_count + Rsmi::device_count + Asysfs::device_count + i] = device_names[i];
+			}
+
+			initialized = true;
+			Logger::info("Using Intel sysfs (GT residency) for {} Intel GPU(s)", device_count);
+			Sysfs::collect<1>(gpus.data() + Nvml::device_count + Rsmi::device_count + Asysfs::device_count);
+			return true;
+		}
+
+		bool shutdown() {
+			if (not initialized) return false;
+			devices.clear();
+			device_count = 0;
+			initialized = false;
+			return true;
+		}
+
+		template <bool is_init> bool collect(gpu_info* gpus_slice) {
+			if (not initialized) return false;
+
+			const long long t_us = get_monotonicTimeUSec();
+
+			for (uint32_t i = 0; i < device_count; ++i) {
+				gpu_info& gpu = gpus_slice[i];
+				device_paths& d = devices[i];
+
+				bool have_freq_path = false;
+				for (auto& gt : d.gts) {
+					if (not gt.freq_act_path.empty() or not gt.freq_cur_path.empty()) { have_freq_path = true; break; }
+				}
+
+				if constexpr (is_init) {
+					gpu.supported_functions = {
+						.gpu_utilization = true,
+						.mem_utilization = false,
+						.gpu_clock = have_freq_path,
+						.mem_clock = false,
+						.pwr_usage = not d.hwmon.empty(),
+						.pwr_state = false,
+						.temp_info = not d.hwmon.empty() and std::filesystem::exists(d.hwmon / "temp1_input"),
+						.mem_total = false, //? Intel has no simple universal sysfs VRAM node; deferred, see INTEL_XPU.md
+						.mem_used = false,
+						.pcie_txrx = false,
+						.encoder_utilization = false,
+						.decoder_utilization = false,
+					};
+					gpu.pwr_max_usage = 0;
+				}
+
+				//? Busy% = max(100 - idle%) across this card's GTs, derived from the delta in
+				//? RC6/idle-residency over wall time. This is immune to the legacy PMU tier's
+				//? "max over individual engine instances" undercount — see INTEL_XPU.md.
+				double best_busy = -1.0;
+				double act_sum = 0;
+				int act_cnt = 0;
+				for (auto& gt : d.gts) {
+					const long long res = read_ll(gt.residency_path, -1);
+					if (res >= 0) {
+						if (gt.prev_res_ms >= 0 and t_us > gt.prev_t_us) {
+							const double dwall_ms = (double)(t_us - gt.prev_t_us) / 1000.0;
+							const double dres_ms = (double)(res - gt.prev_res_ms);
+							if (dwall_ms > 0) {
+								const double idle_pct = std::clamp(100.0 * dres_ms / dwall_ms, 0.0, 100.0);
+								const double busy = 100.0 - idle_pct;
+								if (busy > best_busy) best_busy = busy;
+							}
+						}
+						gt.prev_res_ms = res;
+						gt.prev_t_us = t_us;
+					}
+
+					//? act_freq reads 0 while the GT is parked in RC6; cur_freq (requested
+					//? frequency) is the meaningful number then.
+					if (not gt.freq_act_path.empty() or not gt.freq_cur_path.empty()) {
+						long long f = gt.freq_act_path.empty() ? 0 : read_ll(gt.freq_act_path, 0);
+						if (f <= 0 and not gt.freq_cur_path.empty()) f = read_ll(gt.freq_cur_path, 0);
+						if (f > 0) { act_sum += (double)f; act_cnt++; }
+					}
+				}
+
+				if (best_busy >= 0.0) {
+					gpu.gpu_percent.at("gpu-totals").push_back((long long)std::round(best_busy));
+				} else if constexpr (is_init) {
+					//? Seed the graph for callers that expect a value immediately after init.
+					gpu.gpu_percent.at("gpu-totals").push_back(0);
+				}
+
+				if (act_cnt > 0) {
+					gpu.gpu_clock_speed = (unsigned int)std::round(act_sum / act_cnt);
+				}
+
+				if (not d.hwmon.empty()) {
+					const auto avg_path = d.hwmon / "power1_average";
+					const auto inst_path = d.hwmon / "power1_input";
+					long long pw_uw = -1;
+					if (std::filesystem::exists(avg_path)) pw_uw = read_ll(avg_path, -1);
+					else if (std::filesystem::exists(inst_path)) pw_uw = read_ll(inst_path, -1);
+
+					if (pw_uw >= 0) {
+						gpu.pwr_usage = pw_uw / 1000; //? microwatts -> milliwatts
+
+						if constexpr (is_init) {
+							//? Prefer the driver-reported cap over letting the observed peak set
+							//? the scale (power1_max -> power1_rated_max -> power1_cap).
+							long long cap_uw = -1;
+							if (std::filesystem::exists(d.hwmon / "power1_max")) cap_uw = read_ll(d.hwmon / "power1_max", -1);
+							else if (std::filesystem::exists(d.hwmon / "power1_rated_max")) cap_uw = read_ll(d.hwmon / "power1_rated_max", -1);
+							else if (std::filesystem::exists(d.hwmon / "power1_cap")) cap_uw = read_ll(d.hwmon / "power1_cap", -1);
+							if (cap_uw > 0) gpu.pwr_max_usage = cap_uw / 1000;
+						}
+						gpu.pwr_max_usage = std::max(gpu.pwr_max_usage, gpu.pwr_usage);
+
+						if (gpu.pwr_max_usage > 0) {
+							gpu.gpu_percent.at("gpu-pwr-totals").push_back(
+								std::clamp((long long)std::round((double)gpu.pwr_usage * 100.0 / (double)gpu.pwr_max_usage), 0ll, 100ll));
+						}
+					}
+
+					const auto temp_path = d.hwmon / "temp1_input";
+					if (std::filesystem::exists(temp_path)) {
+						gpu.temp.push_back(read_ll(temp_path) / 1000); //? millidegrees -> degrees
+					}
+				}
+			}
+			return true;
+		}
+
+		//? Explicit template instantiations referenced from Shared::init and Gpu::collect.
+		template bool collect<0>(gpu_info*);
+		template bool collect<1>(gpu_info*);
+	}
+
+	namespace Intel::LevelZero {
+		//? Function pointers, dlsym'd at runtime — Level Zero is optional and not everyone
+		//? has libze_loader installed, so this mirrors how Nvml/Rsmi are loaded dynamically.
+		//? decltype(&::symbol) pulls the exact prototype from the real header included above,
+		//? so there's no risk of a hand-typed signature mismatching the real ABI.
+		decltype(&::zesInit) zesInit = nullptr;
+		decltype(&::zesDriverGet) zesDriverGet = nullptr;
+		decltype(&::zesDeviceGet) zesDeviceGet = nullptr;
+		decltype(&::zesDeviceGetProperties) zesDeviceGetProperties = nullptr;
+		decltype(&::zesDeviceEnumEngineGroups) zesDeviceEnumEngineGroups = nullptr;
+		decltype(&::zesEngineGetProperties) zesEngineGetProperties = nullptr;
+		decltype(&::zesEngineGetActivity) zesEngineGetActivity = nullptr;
+		decltype(&::zesDeviceEnumMemoryModules) zesDeviceEnumMemoryModules = nullptr;
+		decltype(&::zesMemoryGetProperties) zesMemoryGetProperties = nullptr;
+		decltype(&::zesMemoryGetState) zesMemoryGetState = nullptr;
+		decltype(&::zesDeviceEnumPowerDomains) zesDeviceEnumPowerDomains = nullptr;
+		decltype(&::zesPowerGetEnergyCounter) zesPowerGetEnergyCounter = nullptr;
+		decltype(&::zesPowerGetProperties) zesPowerGetProperties = nullptr;
+		decltype(&::zesPowerGetLimits) zesPowerGetLimits = nullptr;
+		decltype(&::zesDeviceEnumFrequencyDomains) zesDeviceEnumFrequencyDomains = nullptr;
+		decltype(&::zesFrequencyGetProperties) zesFrequencyGetProperties = nullptr;
+		decltype(&::zesFrequencyGetState) zesFrequencyGetState = nullptr;
+
+		bool init() {
+			if (initialized) return false;
+
+			//? Try possible library names for libze_loader.so
+			const array libZeAlts = {
+				"libze_loader.so.1",
+				"libze_loader.so",
+			};
+
+			for (const auto& l : libZeAlts) {
+				ze_dl_handle = dlopen(l, RTLD_LAZY);
+				if (ze_dl_handle != nullptr) break;
+			}
+			if (!ze_dl_handle) {
+				Logger::debug("Intel GPU: Failed to load libze_loader.so, Level Zero backend unavailable: {}", dlerror());
+				return false;
+			}
+
+			auto load_ze_sym = [&](const char sym_name[]) {
+				auto sym = dlsym(ze_dl_handle, sym_name);
+				auto err = dlerror();
+				if (err != nullptr) {
+					Logger::debug("Intel GPU: Level Zero: couldn't find function {}: {}", sym_name, err);
+					return (void*)nullptr;
+				} else return sym;
+			};
+
+			#define LOAD_SYM(NAME) if ((NAME = (decltype(NAME))load_ze_sym(#NAME)) == nullptr) { \
+				dlclose(ze_dl_handle); ze_dl_handle = nullptr; return false; }
+
+			LOAD_SYM(zesInit);
+			LOAD_SYM(zesDriverGet);
+			LOAD_SYM(zesDeviceGet);
+			LOAD_SYM(zesDeviceGetProperties);
+			LOAD_SYM(zesDeviceEnumEngineGroups);
+			LOAD_SYM(zesEngineGetProperties);
+			LOAD_SYM(zesEngineGetActivity);
+			LOAD_SYM(zesDeviceEnumMemoryModules);
+			LOAD_SYM(zesMemoryGetProperties);
+			LOAD_SYM(zesMemoryGetState);
+			LOAD_SYM(zesDeviceEnumPowerDomains);
+			LOAD_SYM(zesPowerGetEnergyCounter);
+			LOAD_SYM(zesPowerGetProperties);
+			LOAD_SYM(zesPowerGetLimits);
+			LOAD_SYM(zesDeviceEnumFrequencyDomains);
+			LOAD_SYM(zesFrequencyGetProperties);
+			LOAD_SYM(zesFrequencyGetState);
+
+			#undef LOAD_SYM
+
+			//? Required by the Level Zero Sysman API before zesInit, or driver/device
+			//? enumeration silently comes back empty. Don't clobber a user's own setting.
+			setenv("ZES_ENABLE_SYSMAN", "1", 0);
+
+			const auto init_result = zesInit(0);
+			if (init_result != ZE_RESULT_SUCCESS) {
+				Logger::debug("Intel GPU: zesInit failed ({})", static_cast<uint32_t>(init_result));
+				dlclose(ze_dl_handle); ze_dl_handle = nullptr;
+				return false;
+			}
+
+			const auto enumerate_handles = []<typename handle_t>(vector<handle_t>& handles, const auto& query) {
+				handles.clear();
+				uint32_t count{};
+				if (query(&count, nullptr) != ZE_RESULT_SUCCESS or count == 0)
+					return false;
+				handles.resize(count);
+				if (query(&count, handles.data()) != ZE_RESULT_SUCCESS) {
+					handles.clear();
+					return false;
+				}
+				return true;
+			};
+
+			vector<zes_driver_handle_t> drivers;
+			if (not enumerate_handles(drivers, [](uint32_t* count, zes_driver_handle_t* handles) {
+					return zesDriverGet(count, handles);
+				})) {
+				Logger::debug("Intel GPU: Level Zero did not report any drivers");
+				dlclose(ze_dl_handle); ze_dl_handle = nullptr;
+				return false;
+			}
+
+			const auto property_string = [](const auto& value) {
+				return string(std::begin(value), std::find(std::begin(value), std::end(value), '\0'));
+			};
+
+			for (const auto driver : drivers) {
+				vector<zes_device_handle_t> devices;
+				enumerate_handles(devices, [driver](uint32_t* count, zes_device_handle_t* handles) {
+					return zesDeviceGet(driver, count, handles);
+				});
+
+				for (const auto candidate : devices) {
+					zes_device_properties_t properties{};
+					properties.stype = ZES_STRUCTURE_TYPE_DEVICE_PROPERTIES;
+					properties.core.stype = ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES;
+					if (zesDeviceGetProperties(candidate, &properties) != ZE_RESULT_SUCCESS) continue;
+
+					if (properties.core.type == ZE_DEVICE_TYPE_GPU and properties.core.vendorId == 0x8086) {
+						XeDeviceState state;
+						state.device = candidate;
+
+						//? Engines
+						vector<zes_engine_handle_t> engine_handles;
+						enumerate_handles(engine_handles, [candidate](uint32_t* count, zes_engine_handle_t* handles) {
+							return zesDeviceEnumEngineGroups(candidate, count, handles);
+						});
+						for (const auto handle : engine_handles) {
+							zes_engine_properties_t e_props{};
+							e_props.stype = ZES_STRUCTURE_TYPE_ENGINE_PROPERTIES;
+							zes_engine_stats_t e_stats{};
+							if (zesEngineGetProperties(handle, &e_props) == ZE_RESULT_SUCCESS
+								and zesEngineGetActivity(handle, &e_stats) == ZE_RESULT_SUCCESS) {
+								state.engines.push_back({handle, e_props.type, e_stats});
+							}
+						}
+
+						//? Memory
+						vector<zes_mem_handle_t> memory_handles;
+						enumerate_handles(memory_handles, [candidate](uint32_t* count, zes_mem_handle_t* handles) {
+							return zesDeviceEnumMemoryModules(candidate, count, handles);
+						});
+						for (const auto handle : memory_handles) {
+							zes_mem_properties_t m_props{};
+							m_props.stype = ZES_STRUCTURE_TYPE_MEM_PROPERTIES;
+							zesMemoryGetProperties(handle, &m_props);
+							zes_mem_state_t m_state{};
+							m_state.stype = ZES_STRUCTURE_TYPE_MEM_STATE;
+							if (zesMemoryGetState(handle, &m_state) == ZE_RESULT_SUCCESS) {
+								const uint64_t total = m_state.size > 0 ? m_state.size : m_props.physicalSize;
+								if (total > 0) state.memory_modules.push_back({handle, m_props.physicalSize, total, min(m_state.free, total)});
+							}
+						}
+
+						//? Power
+						vector<zes_pwr_handle_t> power_handles;
+						enumerate_handles(power_handles, [candidate](uint32_t* count, zes_pwr_handle_t* handles) {
+							return zesDeviceEnumPowerDomains(candidate, count, handles);
+						});
+						for (const auto handle : power_handles) {
+							zes_power_energy_counter_t p_stats{};
+							if (zesPowerGetEnergyCounter(handle, &p_stats) == ZE_RESULT_SUCCESS) {
+								zes_power_properties_t p_props{};
+								p_props.stype = ZES_STRUCTURE_TYPE_POWER_PROPERTIES;
+								zes_power_sustained_limit_t sustained{};
+								if (zesPowerGetLimits(handle, &sustained, nullptr, nullptr) == ZE_RESULT_SUCCESS and sustained.power > 0)
+									state.power_limit = sustained.power;
+								else if (zesPowerGetProperties(handle, &p_props) == ZE_RESULT_SUCCESS and p_props.defaultLimit > 0)
+									state.power_limit = p_props.defaultLimit;
+
+								state.power_handle = handle;
+								state.power_stats = p_stats;
+								break;
+							}
+						}
+
+						//? Frequency
+						vector<zes_freq_handle_t> freq_handles;
+						enumerate_handles(freq_handles, [candidate](uint32_t* count, zes_freq_handle_t* handles) {
+							return zesDeviceEnumFrequencyDomains(candidate, count, handles);
+						});
+						for (const auto handle : freq_handles) {
+							zes_freq_properties_t f_props{};
+							f_props.stype = ZES_STRUCTURE_TYPE_FREQ_PROPERTIES;
+							if (zesFrequencyGetProperties(handle, &f_props) == ZE_RESULT_SUCCESS
+								and f_props.type == ZES_FREQ_DOMAIN_GPU) {
+								state.frequency_handle = handle;
+								break;
+							}
+						}
+
+						if (state.engines.empty() and state.memory_modules.empty()
+							and state.power_handle == nullptr and state.frequency_handle == nullptr) continue;
+
+						state.initialized = true;
+						device_states.push_back(state);
+					}
+				}
+			}
+
+			if (device_states.empty()) {
+				Logger::debug("Intel GPU: Level Zero did not report any Intel GPUs with telemetry");
+				dlclose(ze_dl_handle); ze_dl_handle = nullptr;
+				return false;
+			}
+
+			device_count = (uint32_t)device_states.size();
+			gpus.resize(gpus.size() + device_count);
+			gpu_names.resize(gpus.size());
+			const auto gpu_index = Nvml::device_count + Rsmi::device_count + Asysfs::device_count;
+
+			for (uint32_t i = 0; i < device_count; ++i) {
+				zes_device_properties_t props{};
+				props.stype = ZES_STRUCTURE_TYPE_DEVICE_PROPERTIES;
+				props.core.stype = ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES;
+				zesDeviceGetProperties(device_states[i].device, &props);
+
+				const string core_name = property_string(props.core.name);
+				const string model_name = property_string(props.modelName);
+				auto usable_name = [](const string& name) {
+					return not name.empty() and name != "unknown" and name != "Unknown" and name != "(unknown)";
+				};
+
+				if (usable_name(model_name)) gpu_names[gpu_index + i] = model_name;
+				else if (usable_name(core_name)) gpu_names[gpu_index + i] = core_name;
+				else gpu_names[gpu_index + i] = fmt::format("Intel GPU [0x{:04x}]", props.core.deviceId);
+			}
+
+			initialized = true;
+			Intel::LevelZero::collect<1>(gpus.data() + gpu_index);
+
+			return true;
+		}
+
+		bool shutdown() {
+			if (!initialized) return false;
+			device_states.clear();
+			device_count = 0;
+			initialized = false;
+			if (ze_dl_handle) {
+				dlclose(ze_dl_handle);
+				ze_dl_handle = nullptr;
+			}
+			return true;
+		}
+
+		template <bool is_init> bool collect(gpu_info* gpus_slice) {
+			if (!initialized) return false;
+
+			if constexpr(is_init) {
+				for (uint32_t i = 0; i < device_count; ++i) {
+					auto& state = device_states[i];
+					gpu_info& gpu = gpus_slice[i];
+					gpu.supported_functions = {
+						.gpu_utilization = not state.engines.empty(),
+						.mem_utilization = false,
+						.gpu_clock = state.frequency_handle != nullptr,
+						.mem_clock = false,
+						.pwr_usage = state.power_handle != nullptr,
+						.pwr_state = false,
+						.temp_info = false,
+						.mem_total = not state.memory_modules.empty(),
+						.mem_used = not state.memory_modules.empty(),
+						.pcie_txrx = false,
+						.encoder_utilization = false,
+						.decoder_utilization = false
+					};
+
+					gpu.gpu_clock_speed = 0;
+					gpu.pwr_usage = 0;
+					if (state.power_limit > 0)
+						gpu.pwr_max_usage = state.power_limit;
+					if (state.power_handle != nullptr)
+						gpu_pwr_total_max += gpu.pwr_max_usage;
+				}
+			}
+
+			if (not device_states.empty()) {
+				struct engine_sample {
+					zes_engine_group_t type;
+					double utilization;
+				};
+				vector<engine_sample> samples;
+				samples.reserve(device_states[0].engines.size());
+
+				for (uint32_t i = 0; i < device_count; ++i) {
+					auto& state = device_states[i];
+					gpu_info& gpu = gpus_slice[i];
+					samples.clear();
+
+					for (auto& engine : state.engines) {
+						zes_engine_stats_t current{};
+						if (zesEngineGetActivity(engine.handle, &current) != ZE_RESULT_SUCCESS) continue;
+
+						if (current.timestamp > engine.stats.timestamp
+							and current.activeTime >= engine.stats.activeTime) {
+							const double active = current.activeTime - engine.stats.activeTime;
+							const double elapsed = current.timestamp - engine.stats.timestamp;
+							samples.push_back({
+								engine.type,
+								clamp(active * 100.0 / elapsed, 0.0, 100.0)
+							});
+							engine.stats = current;
+						} else if (current.timestamp < engine.stats.timestamp
+							or current.activeTime < engine.stats.activeTime) {
+							//? Counter reset: establish a new baseline without emitting a false 0% sample.
+							engine.stats = current;
+						}
+					}
+
+					const auto aggregate_priority = [](const zes_engine_group_t type) {
+						switch (type) {
+							case ZES_ENGINE_GROUP_ALL: return 3;
+							case ZES_ENGINE_GROUP_RENDER_ALL: return 2;
+							case ZES_ENGINE_GROUP_COMPUTE_ALL: return 1;
+							default: return 0;
+						}
+					};
+
+					std::optional<double> selected_utilization;
+					int selected_priority = 0;
+					for (const auto& sample : samples) {
+						const int priority = aggregate_priority(sample.type);
+						if (priority > selected_priority) {
+							selected_utilization = sample.utilization;
+							selected_priority = priority;
+						}
+					}
+
+					if (not selected_utilization) {
+						double maximum = -1.0;
+						for (const auto& sample : samples) {
+							switch (sample.type) {
+								case ZES_ENGINE_GROUP_COMPUTE_SINGLE:
+								case ZES_ENGINE_GROUP_RENDER_SINGLE:
+								case ZES_ENGINE_GROUP_COPY_SINGLE:
+								case ZES_ENGINE_GROUP_MEDIA_DECODE_SINGLE:
+								case ZES_ENGINE_GROUP_MEDIA_ENCODE_SINGLE:
+								case ZES_ENGINE_GROUP_MEDIA_ENHANCEMENT_SINGLE:
+								case ZES_ENGINE_GROUP_MEDIA_CODEC_SINGLE:
+								case ZES_ENGINE_GROUP_3D_SINGLE:
+									maximum = max(maximum, sample.utilization);
+								break;
+								default:
+								break;
+							}
+						}
+						if (maximum >= 0.0) selected_utilization = maximum;
+					}
+
+					if (selected_utilization) {
+						gpu.gpu_percent.at("gpu-totals").push_back(
+							(long long)round(*selected_utilization));
+					} else if constexpr(is_init) {
+						//? Seed the graph for callers that expect a value immediately after init.
+						gpu.gpu_percent.at("gpu-totals").push_back(0);
+					}
+				}
+			}
+
+			if (not device_states.empty()) {
+				for (uint32_t i = 0; i < device_count; ++i) {
+					auto& state = device_states[i];
+					gpu_info& gpu = gpus_slice[i];
+					uint64_t total_memory = 0;
+					uint64_t free_memory = 0;
+					bool has_memory_sample = false;
+
+					for (auto& memory : state.memory_modules) {
+						zes_mem_state_t m_state{};
+						m_state.stype = ZES_STRUCTURE_TYPE_MEM_STATE;
+						if (zesMemoryGetState(memory.handle, &m_state) == ZE_RESULT_SUCCESS) {
+							const uint64_t module_total = m_state.size > 0 ? m_state.size : memory.physical_size;
+							if (module_total > 0) {
+								memory.size = module_total;
+								memory.free = min(m_state.free, module_total);
+							}
+						}
+
+						total_memory += memory.size;
+						free_memory += memory.free;
+						has_memory_sample = true;
+					}
+
+					if (has_memory_sample and total_memory > 0) {
+						gpu.mem_total = static_cast<long long>(total_memory);
+						gpu.mem_used = static_cast<long long>(total_memory - free_memory);
+						gpu.gpu_percent.at("gpu-vram-totals").push_back(
+							clamp((long long)round((double)gpu.mem_used * 100.0
+								/ (double)gpu.mem_total), 0ll, 100ll));
+					}
+				}
+			}
+
+			if (not device_states.empty()) {
+				for (uint32_t i = 0; i < device_count; ++i) {
+					auto& state = device_states[i];
+					gpu_info& gpu = gpus_slice[i];
+					zes_power_energy_counter_t current{};
+					if (state.power_handle != nullptr and zesPowerGetEnergyCounter(state.power_handle, &current) == ZE_RESULT_SUCCESS) {
+						if (current.timestamp > state.power_stats.timestamp and current.energy >= state.power_stats.energy) {
+							//? microjoules / microseconds = watts
+							const double power = (double)(current.energy - state.power_stats.energy)
+								/ (double)(current.timestamp - state.power_stats.timestamp);
+							gpu.pwr_usage = (long long)round(power * 1000);
+						}
+						state.power_stats = current;
+					}
+					if (state.power_handle != nullptr) {
+						gpu.gpu_percent.at("gpu-pwr-totals").push_back(
+							clamp((long long)round((double)gpu.pwr_usage * 100.0
+								/ (double)gpu.pwr_max_usage), 0ll, 100ll));
+					}
+				}
+			}
+
+			if (not device_states.empty()) {
+				for (uint32_t i = 0; i < device_count; ++i) {
+					auto& state = device_states[i];
+					gpu_info& gpu = gpus_slice[i];
+					if (state.frequency_handle != nullptr) {
+						zes_freq_state_t f_state{};
+						f_state.stype = ZES_STRUCTURE_TYPE_FREQ_STATE;
+						if (zesFrequencyGetState(state.frequency_handle, &f_state) == ZE_RESULT_SUCCESS and f_state.actual >= 0)
+							gpu.gpu_clock_speed = (unsigned int)round(f_state.actual);
+					}
+				}
+			}
+
+			return true;
+		}
+
+		//? Explicit template instantiations referenced from Shared::init and Gpu::collect.
+		template bool collect<0>(gpu_info*);
+		template bool collect<1>(gpu_info*);
+	}
+
 	namespace Asysfs {
 		//? Read a sysfs node containing a single integer; return fallback on missing/parse error.
 		static long long read_ll(const std::filesystem::path& path, long long fallback = 0) {
@@ -2221,6 +3056,10 @@ namespace Gpu {
 		Nvml::collect<0>(gpus.data()); // raw pointer to vector data, size == Nvml::device_count
 		Rsmi::collect<0>(gpus.data() + Nvml::device_count); // size = Rsmi::device_count
 		Asysfs::collect<0>(gpus.data() + Nvml::device_count + Rsmi::device_count); // size = Asysfs::device_count
+		//? At most one of these three is ever initialized (see Shared::init); each is a no-op
+		//? when its own device_count == 0, exactly like the backends above.
+		Intel::LevelZero::collect<0>(gpus.data() + Nvml::device_count + Rsmi::device_count + Asysfs::device_count);
+		Intel::Sysfs::collect<0>(gpus.data() + Nvml::device_count + Rsmi::device_count + Asysfs::device_count);
 		Intel::collect<0>(gpus.data() + Nvml::device_count + Rsmi::device_count + Asysfs::device_count); // size = Intel::device_count
 
 		//* Calculate average usage

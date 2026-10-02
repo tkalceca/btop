@@ -117,7 +117,7 @@ jobs:
           persist-credentials: false
 
       - name: Install build tools
-        run: apk add --update --no-cache g++ linux-headers make mold
+        run: apk add --update --no-cache g++ linux-headers make mold level-zero
 
       - name: Build
         run: make GPU_SUPPORT=true

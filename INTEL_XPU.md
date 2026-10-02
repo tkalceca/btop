@@ -1,0 +1,117 @@
+# Intel GPU monitoring: backend architecture
+
+This document describes fork-specific changes to how `btop` monitors Intel GPUs on
+Linux. It intentionally lives outside `README.md` so the main upstream documentation
+stays untouched and easy to keep in sync with `aristocratos/btop`.
+
+(The name is `INTEL_XPU.md` rather than `INTEL_GPU.md` because future backends may
+target other Intel accelerator classes beyond GPUs, e.g. NPUs.)
+
+## The bug this fixes
+
+Upstream `btop`'s Intel GPU backend (`Gpu::Intel`, in `src/linux/btop_collect.cpp`,
+backed by the vendored `igt-gpu-tools`-derived sources in
+`src/linux/intel_gpu_top/`) computes the headline "GPU busy%" as:
+
+```cpp
+double max_util = 0;
+for (each i915/xe PMU per-engine "busy" counter)
+    max_util = max(max_util, engine_busy_pct);
+```
+
+On Xe-architecture GPUs (Arc, Lunar Lake, Battlemage, Meteor Lake and newer), a single
+fully-saturating workload is commonly dispatched across **multiple parallel engine
+instances** (e.g. two CCS compute queues). Each instance individually peaks around
+50% even though the GPU die is fully busy, so `max()` across engines never reports
+anywhere close to 100%. This is the root cause of the "graph stuck around 50% under
+100% load" symptom.
+
+Two adjacent bugs live in the same code path:
+- The PMU device name is hardcoded to `"i915"`, so GPUs bound to the newer `xe` kernel
+  driver (Arc, Lunar Lake, Battlemage, some Meteor Lake configurations) aren't detected
+  at all by this backend.
+- `device_count` is hardcoded to `1`, so only the first Intel GPU on a multi-GPU system
+  is ever reported.
+
+## The fix: a 3-tier runtime fallback chain
+
+`Shared::init()` now tries three backends in order, the richest/most broadly-available
+first, falling back only if the previous one fails to initialize:
+
+| Priority | Backend | Trigger | Notes |
+|---|---|---|---|
+| 1 | `Gpu::Intel::LevelZero` | `dlopen("libze_loader.so.1")` succeeds and `zesInit`/`zesDriverGet` finds a driver | Richest telemetry: accurate VRAM via `zesMemoryGetState`, true per-engine activity via `zesEngineGetActivity` (not susceptible to the split-engine undercount). Optional — gracefully skipped if the library isn't installed. |
+| 2 | `Gpu::Intel::Sysfs` | GT RC6/idle-residency sysfs files found under `/sys/class/drm/card*` | The practical default fix. Pure sysfs reads, no special permissions needed. |
+| 3 | `Gpu::Intel` (legacy PMU) | Only reached if both tiers above fail to initialize | Unmodified upstream code, kept byte-for-byte for upstream traceability. Only reachable on a kernel old enough to lack the GT residency sysfs files entirely (i915 predating ~2012-era kernels) — effectively a theoretical last resort on any supported system today. |
+
+Exactly one tier is ever active. `Gpu::collect()` and the `btop.cpp` shutdown sequence
+call all three unconditionally; each is a no-op (`device_count == 0`) when it isn't the
+active tier — the same pattern already used to let `Rsmi` and `Asysfs` coexist for AMD.
+
+### Why `Gpu::Intel::Sysfs` fixes the bug
+
+Instead of per-engine PMU busy counters, this backend reads each GT's **RC6/idle
+residency** counter — "% of time the GPU block was *not* power-gated":
+
+- `xe` driver: `.../device/tileN/gtM/gtidle/idle_residency_ms`
+- `i915` driver, multi-GT (Meteor Lake+): `.../card/gt/gtN/rc6_residency_ms`
+- `i915` driver, legacy single-GT: `.../card/power/rc6_residency_ms`
+
+`busy% = 100 - (100 * Δresidency_ms / Δwall_ms)`, taking the max across a card's GTs.
+This reflects whether the GPU was doing *any* work at all, regardless of how many
+engine instances that work was split across, so it doesn't suffer the legacy PMU
+backend's undercount. It also dynamically detects whether the bound driver is `i915`
+or `xe` (via the `device/driver` symlink) instead of assuming `i915`, and enumerates
+every Intel GPU under `/sys/class/drm/card*` instead of only the first one found.
+
+Power is read from `hwmon/power1_average` (falling back to `power1_input`), with the
+power cap preferred from `power1_max` → `power1_rated_max` → `power1_cap` over letting
+the observed peak set the scale. Clock speed is the average of each GT's active
+frequency (falling back to the requested/current frequency when a GT is parked in
+RC6, which reads an active frequency of 0).
+
+### Why `Gpu::Intel::LevelZero` is now `dlopen`-based
+
+Previously, Level Zero support (in the separate `tkalceca/btop-gpu-lz` repository this
+was prototyped in) was gated behind a compile-time CMake flag and hard-linked against
+`ze_loader`. That meant a binary built with the flag on would refuse to start on a
+machine without the library installed. This fork instead loads `libze_loader.so.1`
+(falling back to `libze_loader.so`) via `dlopen`/`dlsym` at runtime, exactly like the
+existing `Nvml` (`libnvidia-ml.so`) and `Rsmi` (`librocm_smi64.so`) backends already
+do — always compiled in, gracefully skipped if the library isn't present.
+
+It also sets `ZES_ENABLE_SYSMAN=1` (without clobbering a user's own setting) before
+calling `zesInit`, which the Level Zero Sysman API requires — this was missing
+entirely before, meaning the Level Zero backend could silently enumerate zero drivers
+even when the library was correctly installed and linked.
+
+## Build requirements
+
+`Gpu::Intel::LevelZero` needs the Level Zero **headers** (`level_zero/zes_api.h`) at
+**build time only** (for struct/enum definitions — the library itself is resolved at
+runtime via `dlopen`). This follows the exact precedent `Rsmi` already sets for
+`<rocm_smi/rocm_smi.h>` in its static-linking mode.
+
+Install the relevant package before building with `GPU_SUPPORT=true` (or `-DBTOP_GPU=ON`):
+
+| Distro | Package |
+|---|---|
+| Alpine | `level-zero` (`community` repo) |
+| Debian / Ubuntu | `libze-dev` (or `liboneapi-level-zero-dev` on some releases) |
+| Fedora | `oneapi-level-zero-devel` |
+
+No extra link-time library is required — there is no `ze_loader` entry in
+`target_link_libraries`/the Makefile's link step; the library is resolved purely at
+runtime via `dlopen`.
+
+## Deferred / out of scope for this change
+
+- **VRAM reporting for the `Sysfs` tier.** Unlike AMD (`mem_info_vram_total`/`_used`
+  directly in sysfs), Intel has no simple universal sysfs node for VRAM usage. Level
+  Zero's `zesMemoryGetState` already covers this when available; a sysfs-only
+  equivalent would need a render-node ioctl query, which is a larger, separable
+  follow-up.
+- **RAPL "uncore" power fallback** for the `Sysfs` tier on integrated GPUs without a
+  dedicated hwmon power node. Not needed to fix the reported busy% bug; a nice-to-have
+  for a future pass.
+- `Nvml`/`Rsmi`/`Asysfs` (NVIDIA/AMD) are unchanged — this pass is Intel-only.

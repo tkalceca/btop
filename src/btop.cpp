@@ -229,6 +229,11 @@ void clean_quit(int sig) {
 	Gpu::Nvml::shutdown();
 	Gpu::Rsmi::shutdown();
 	Gpu::Asysfs::shutdown();
+	//? At most one of these three is ever initialized (see Shared::init); each is a no-op
+	//? when it isn't, exactly like the backends above.
+	Gpu::Intel::LevelZero::shutdown();
+	Gpu::Intel::Sysfs::shutdown();
+	Gpu::Intel::shutdown();
 	#ifdef __APPLE__
 	Gpu::AppleSilicon::shutdown();
 	#endif
