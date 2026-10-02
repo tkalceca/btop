@@ -191,3 +191,17 @@ carrying seamlessly across the boundary. No new config value — an NPU-only mac
 (no GPU at all) now also triggers this split via `"Auto"`, showing just its NPU
 segment(s) alone.
 
+### `xpu-totals`: a clearer name for the same combined split
+
+`"gpu-totals"` is genuine upstream btop naming (shared by `Nvml`/`Rsmi`/`Asysfs`/the
+macOS `AppleSilicon` backend too — confirmed by grepping `src/osx/btop_collect.cpp`,
+which we've never touched) and is also a user-facing, persisted config value, so it
+isn't renamed. Instead, `"xpu-totals"` is added as a second, purely additive
+selectable value for `cpu_graph_upper`/`cpu_graph_lower` that behaves **identically**
+to `"gpu-totals"` (same combined GPU+NPU split segments) — it's resolved to the real
+`"gpu-totals"` key at the point of use in `Cpu::draw()` (`actual_up_field`/
+`actual_lo_field`), while the on-screen field-name label keeps showing whichever name
+the user actually picked. `"gpu-totals"` keeps working exactly as before; `"xpu-totals"`
+is just a clearer name for anyone who finds it more accurate now that NPUs can join
+the same split.
+

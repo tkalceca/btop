@@ -534,6 +534,10 @@ namespace Shared {
 				Cpu::available_fields.push_back(key);
 			for (auto const& [key, _] : Gpu::shared_gpu_percent)
 				Cpu::available_fields.push_back(key);
+			//? Pure UI alias for "gpu-totals" (same combined GPU+NPU split view,
+			//? see INTEL_XPU.md) — not a real gpu_percent key, resolved in
+			//? Cpu::draw(). A clearer name now that NPUs can join the split too.
+			Cpu::available_fields.push_back("xpu-totals");
 
 			using namespace Gpu;
 			count = gpus.size();

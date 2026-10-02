@@ -605,6 +605,13 @@ namespace Cpu {
 			graph_lo_field = graph_up_field;
 		#endif
 		}
+		//? "xpu-totals" is a pure UI alias for "gpu-totals" (same combined GPU+NPU
+		//? split view) — translate it here so the data lookup always hits the real
+		//? key, while graph_up_field/graph_lo_field (used for the on-screen label,
+		//? and the "is this actually different content" check below) keep showing
+		//? whatever the user actually picked. See INTEL_XPU.md.
+		auto actual_up_field = graph_up_field == "xpu-totals"s ? "gpu-totals"s : graph_up_field;
+		auto actual_lo_field = graph_lo_field == "xpu-totals"s ? "gpu-totals"s : graph_lo_field;
 		auto tty_mode = Config::getB("tty_mode");
 		auto& graph_symbol = (tty_mode ? "tty" : Config::getS("graph_symbol_cpu"));
 		auto& graph_bg = Symbols::graph_symbols.at((graph_symbol == "default" ? Config::getS("graph_symbol") + "_up" : graph_symbol + "_up")).at(6);
@@ -624,7 +631,7 @@ namespace Cpu {
 
 		//* Redraw elements not needed to be updated every cycle
 		if (redraw) {
-			mid_line = (not single_graph and graph_up_field != graph_lo_field);
+			mid_line = (not single_graph and actual_up_field != actual_lo_field);
 			graph_up_height = (single_graph ? height - 2 : ceil((double)(height - 2) / 2) - (mid_line and height % 2 != 0));
 			graph_low_height = height - 2 - graph_up_height - mid_line;
 			const int button_y = cpu_bottom ? y + height - 1 : y;
@@ -725,9 +732,9 @@ namespace Cpu {
 			#endif
 			};
 
-            init_graphs(graphs_upper, graph_up_height, graph_up_width, graph_up_field, false);
+            init_graphs(graphs_upper, graph_up_height, graph_up_width, actual_up_field, false);
             if (not single_graph)
-            	init_graphs(graphs_lower, graph_low_height, graph_low_width, graph_lo_field, Config::getB("cpu_invert_lower"));
+            	init_graphs(graphs_lower, graph_low_height, graph_low_width, actual_lo_field, Config::getB("cpu_invert_lower"));
 
 			#ifdef GPU_SUPPORT
 			if (show_gpu and b_columns > 1) {
@@ -919,10 +926,10 @@ namespace Cpu {
 					out += graphs[0](safeVal(cpu.cpu_percent, graph_field), (data_same or redraw));
 			};
 
-			draw_graphs(graphs_upper, graph_up_height, graph_up_width, graph_up_field);
+			draw_graphs(graphs_upper, graph_up_height, graph_up_width, actual_up_field);
 			if (not single_graph) {
 				out += Mv::to(y + graph_up_height + 1 + mid_line, x + 1);
-				draw_graphs(graphs_lower, graph_low_height, graph_low_width, graph_lo_field);
+				draw_graphs(graphs_lower, graph_low_height, graph_low_width, actual_lo_field);
 			}
 
 			//? Uptime
