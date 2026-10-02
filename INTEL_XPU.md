@@ -176,3 +176,18 @@ useful, but most of that box's content (VRAM, PCIe, encode/decode) wouldn't appl
 an NPU anyway. Also deferred: AMD Ryzen AI (`amdxdna`), which exposes utilization via
 a DRM ioctl rather than a plain sysfs busy-time file — separate work from what's here.
 
+### NPU segments in the CPU box's split graph
+
+The CPU box's big upper/lower graph area already splits horizontally into one
+segment per GPU whenever `cpu_graph_upper`/`cpu_graph_lower` resolves to
+`"gpu-totals"` (e.g. via `"Auto"`, which picks `gpu-totals` for the lower graph
+whenever a GPU — now also an NPU — is present). Since `Npu::npus` stores busy% under
+that exact same `gpu-totals` key (it reuses `Gpu::gpu_info`), `Cpu::draw()`'s
+`init_graphs`/`draw_graphs` now simply walk GPUs **then** NPUs into the same segment
+row: the available width is divided evenly across the combined GPU+NPU count, GPU
+segments are drawn first (labeled `GPU0`, `GPU1`, ...), NPU segments follow
+immediately after (labeled `NPU0`, `NPU1`, ...), with the same divider-line styling
+carrying seamlessly across the boundary. No new config value — an NPU-only machine
+(no GPU at all) now also triggers this split via `"Auto"`, showing just its NPU
+segment(s) alone.
+

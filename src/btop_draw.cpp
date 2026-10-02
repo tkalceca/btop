@@ -598,7 +598,9 @@ namespace Cpu {
 		auto graph_lo_field = Config::getS("cpu_graph_lower");
 		if (graph_lo_field == "Auto" or not v_contains(Cpu::available_fields, graph_lo_field)) {
 		#ifdef GPU_SUPPORT
-			graph_lo_field = show_gpu ? "gpu-totals" : graph_up_field;
+			//? "gpu-totals" also covers NPUs (they store busy% under the same key,
+			//? since Npu::npus reuses Gpu::gpu_info) — see INTEL_XPU.md.
+			graph_lo_field = (show_gpu or show_npu) ? "gpu-totals" : graph_up_field;
 		#else
 			graph_lo_field = graph_up_field;
 		#endif
@@ -656,15 +658,20 @@ namespace Cpu {
 			#ifdef GPU_SUPPORT
 				if (graph_field.starts_with("gpu")) {
 					if (graph_field.find("totals") != string::npos) {
-						graphs.resize(gpus.size());
+						//? "gpu-totals" also covers NPUs here (same gpu_percent key,
+						//? since Npu::npus reuses Gpu::gpu_info) — GPUs first, NPUs
+						//? appended after, splitting the same row. See INTEL_XPU.md.
+						const size_t total = gpus.size() + npus.size();
+						graphs.resize(total);
 						gpu_temp_graphs.resize(gpus.size());
 						gpu_mem_graphs.resize(gpus.size());
 						gpu_meters.resize(gpus.size());
 						const int gpu_draw_count = gpu_always ? Gpu::count : Gpu::count - Gpu::shown;
-                                                // Fairly distribute graph_default_width across gpu_draw_count GPUs, leaving 1 col per separator.
+						const int total_draw_count = gpu_draw_count + (int)npus.size();
+                                                // Fairly distribute graph_default_width across total_draw_count segments, leaving 1 col per separator.
                                                 // Clamp to >=1 to avoid degenerate/negative widths reaching Draw::Graph::_create (#1118, #1017).
-                                                const int gpu_drawable_width = graph_default_width - max(0, gpu_draw_count - 1);
-                                                graph_width = gpu_draw_count <= 0 ? graph_default_width : max(1, gpu_drawable_width / gpu_draw_count);
+                                                const int drawable_width = graph_default_width - max(0, total_draw_count - 1);
+                                                graph_width = total_draw_count <= 0 ? graph_default_width : max(1, drawable_width / total_draw_count);
 						for (size_t i = 0; i < gpus.size(); i++) {
 							if (gpu_auto and v_contains(Gpu::shown_panels, i))
 								continue;
@@ -672,18 +679,37 @@ namespace Cpu {
 
 							//? GPU graphs
 							if (gpu.supported_functions.gpu_utilization) {
-								if (i + 1 < gpus.size()) {
+								if (i + 1 < total) {
 									graph = Draw::Graph{graph_width, graph_height, "cpu", safeVal(gpu.gpu_percent, graph_field), graph_symbol, invert, true};
 								}
 								else {
 									graph = Draw::Graph{
-                                                                                max(1, graph_width + (gpu_draw_count > 0 ? gpu_drawable_width % gpu_draw_count : 0)),
+                                                                                max(1, graph_width + (total_draw_count > 0 ? drawable_width % total_draw_count : 0)),
 										graph_height, "cpu", safeVal(gpu.gpu_percent, graph_field), graph_symbol, invert, true
 									};
 								}
 							}
 						}
+						//? NPU graphs — appended right after the GPU segments, no
+						//? shown_panels-style skip (NPUs have no dedicated box).
+						for (size_t j = 0; j < npus.size(); j++) {
+							const size_t i = gpus.size() + j;
+							auto& npu = npus[j]; auto& graph = graphs[i];
+
+							if (npu.supported_functions.gpu_utilization) {
+								if (i + 1 < total) {
+									graph = Draw::Graph{graph_width, graph_height, "cpu", safeVal(npu.gpu_percent, graph_field), graph_symbol, invert, true};
+								}
+								else {
+									graph = Draw::Graph{
+										max(1, graph_width + (total_draw_count > 0 ? drawable_width % total_draw_count : 0)),
+										graph_height, "cpu", safeVal(npu.gpu_percent, graph_field), graph_symbol, invert, true
+									};
+								}
+							}
+						}
 					} else {
+
 						graphs.resize(1);
 						graph_width = graph_default_width;
 						graphs[0] = Draw::Graph{ graph_width, graph_height, "cpu", safeVal(Gpu::shared_gpu_percent, graph_field), graph_symbol, invert, true };
@@ -841,7 +867,12 @@ namespace Cpu {
 			#ifdef GPU_SUPPORT
 				if (graph_field.starts_with("gpu"))
 					if (graph_field.ends_with("totals")) {
+						//? "gpu-totals" also covers NPUs here (see init_graphs above
+						//? and INTEL_XPU.md) — a single running counter/total spans
+						//? both loops so labels and divider lines are consistent
+						//? across the GPU/NPU boundary.
 						int gpu_drawn = 0;
+						const int total_draw_count = (gpu_always ? Gpu::count : Gpu::count - Gpu::shown) + (int)npus.size();
 						for (size_t i = 0; i < gpus.size(); i++) {
 							if (gpu_auto and v_contains(Gpu::shown_panels, i)) {
 								continue;
@@ -852,13 +883,29 @@ namespace Cpu {
 							} catch (std::out_of_range& /* unused */) {
 								continue;
 							}
-							if (Gpu::count - (gpu_auto ? Gpu::shown : 0) > 1) {
+							if (total_draw_count > 1) {
 								auto i_str = to_string(i);
 								out += Mv::l(max(0, graph_width-1)) + Mv::u(graph_height/2) + (graph_width > 5 ? "GPU" : "") + i_str
 									+ Mv::d(graph_height/2) + Mv::r(max(0, (int)(graph_width - 1 - (graph_width > 5)*3 - i_str.size())));
 							}
 
-							if (++gpu_drawn < Gpu::count - (gpu_auto ? Gpu::shown : 0))
+							if (++gpu_drawn < total_draw_count)
+								out += Theme::c("div_line") + (Symbols::v_line + Mv::l(1) + Mv::u(1))*graph_height + Mv::r(1) + Mv::d(1);
+						}
+						for (size_t j = 0; j < npus.size(); j++) {
+							try {
+								const auto& npu_percent = npus[j].gpu_percent;
+								out += graphs[gpus.size() + j](safeVal(npu_percent, graph_field), (data_same or redraw));
+							} catch (std::out_of_range& /* unused */) {
+								continue;
+							}
+							if (total_draw_count > 1) {
+								auto j_str = to_string(j);
+								out += Mv::l(max(0, graph_width-1)) + Mv::u(graph_height/2) + (graph_width > 5 ? "NPU" : "") + j_str
+									+ Mv::d(graph_height/2) + Mv::r(max(0, (int)(graph_width - 1 - (graph_width > 5)*3 - j_str.size())));
+							}
+
+							if (++gpu_drawn < total_draw_count)
 								out += Theme::c("div_line") + (Symbols::v_line + Mv::l(1) + Mv::u(1))*graph_height + Mv::r(1) + Mv::d(1);
 						}
 					}
