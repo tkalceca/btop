@@ -1,3 +1,37 @@
+# Build
+
+```sh
+git clone https://github.com/tkalceca/btop.git
+cd btop
+
+# dependencies (list might be incomplete, please report/update)
+sudo apt update
+sudo apt install gcc-14 g++-14 -y
+sudo apt install cmake ninja-build lowdown -y
+# PLEASE FOLLOW:
+# https://dgpu-docs.intel.com/installation-guides/installing-packages-from-the-intel-ppa.html
+sudo apt install libze-dev
+
+# This should automatically use -DUSE_LEVELZERO=ON (level-zero required!)
+# otherwise, switch it off via -DUSE_LEVELZERO=OFF (not verified)
+cmake -B build -G Ninja \
+-DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_C_COMPILER=gcc-14 \
+-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
+
+cmake --build build
+
+# LOCAL
+./build/btop
+
+#GLOBAL
+sudo apt remove btop
+sudo cmake --install build
+# run / exec
+btop
+# uninstall
+sudo xargs rm < build/install_manifest.txt
+```
+
 # Intel GPU monitoring: backend architecture
 
 This document describes fork-specific changes to how `btop` monitors Intel GPUs on
@@ -227,4 +261,3 @@ and stays `"gpu-totals"` on GPU-only machines — so the default label is always
 accurate to what's actually being combined, with no manual menu action needed either
 way. Explicitly selecting either value manually always overrides this and is
 respected as picked.
-
