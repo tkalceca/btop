@@ -2822,49 +2822,29 @@ namespace Gpu {
 						}
 					}
 
-					const auto aggregate_priority = [](const zes_engine_group_t type) {
-						switch (type) {
-							case ZES_ENGINE_GROUP_ALL: return 3;
-							case ZES_ENGINE_GROUP_RENDER_ALL: return 2;
-							case ZES_ENGINE_GROUP_COMPUTE_ALL: return 1;
-							default: return 0;
-						}
-					};
-
-					std::optional<double> selected_utilization;
-					int selected_priority = 0;
+					//? Peak utilization across all active engine domains (Compute, 3D/Render,
+					//? Media, Copy). Explicitly exclude ZES_ENGINE_GROUP_ALL: the Intel Level
+					//? Zero Sysman driver computes it as an arithmetic average across all
+					//? functional domains on the die, so a 100%-saturated compute workload
+					//? with idle copy/media engines reads ~22% instead of 100% (see
+					//? INTEL_XPU.md). Each concrete domain group instead reports "fraction
+					//? of time any engine of that class was active", so the max across them
+					//? matches the GT-residency measurement regardless of the active block.
+					double max_util = -1.0;
 					for (const auto& sample : samples) {
-						const int priority = aggregate_priority(sample.type);
-						if (priority > selected_priority) {
-							selected_utilization = sample.utilization;
-							selected_priority = priority;
+						if (sample.type != ZES_ENGINE_GROUP_ALL) {
+							max_util = max(max_util, sample.utilization);
 						}
 					}
 
-					if (not selected_utilization) {
-						double maximum = -1.0;
-						for (const auto& sample : samples) {
-							switch (sample.type) {
-								case ZES_ENGINE_GROUP_COMPUTE_SINGLE:
-								case ZES_ENGINE_GROUP_RENDER_SINGLE:
-								case ZES_ENGINE_GROUP_COPY_SINGLE:
-								case ZES_ENGINE_GROUP_MEDIA_DECODE_SINGLE:
-								case ZES_ENGINE_GROUP_MEDIA_ENCODE_SINGLE:
-								case ZES_ENGINE_GROUP_MEDIA_ENHANCEMENT_SINGLE:
-								case ZES_ENGINE_GROUP_MEDIA_CODEC_SINGLE:
-								case ZES_ENGINE_GROUP_3D_SINGLE:
-									maximum = max(maximum, sample.utilization);
-								break;
-								default:
-								break;
-							}
-						}
-						if (maximum >= 0.0) selected_utilization = maximum;
+					//? Fallback if the driver only reported ZES_ENGINE_GROUP_ALL.
+					if (max_util < 0.0 and not samples.empty()) {
+						max_util = samples.front().utilization;
 					}
 
-					if (selected_utilization) {
+					if (max_util >= 0.0) {
 						gpu.gpu_percent.at("gpu-totals").push_back(
-							(long long)round(*selected_utilization));
+							(long long)round(max_util));
 					} else if constexpr(is_init) {
 						//? Seed the graph for callers that expect a value immediately after init.
 						gpu.gpu_percent.at("gpu-totals").push_back(0);

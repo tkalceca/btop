@@ -40,7 +40,7 @@ first, falling back only if the previous one fails to initialize:
 
 | Priority | Backend | Trigger | Notes |
 |---|---|---|---|
-| 1 | `Gpu::Intel::LevelZero` | `dlopen("libze_loader.so.1")` succeeds and `zesInit`/`zesDriverGet` finds a driver | Richest telemetry: accurate VRAM via `zesMemoryGetState`, true per-engine activity via `zesEngineGetActivity` (not susceptible to the split-engine undercount). Optional — gracefully skipped if the library isn't installed. |
+| 1 | `Gpu::Intel::LevelZero` | `dlopen("libze_loader.so.1")` succeeds and `zesInit`/`zesDriverGet` finds a driver | Richest telemetry: accurate VRAM via `zesMemoryGetState`, true per-engine activity via `zesEngineGetActivity` — peak across engine domains, excluding the averaged `ZES_ENGINE_GROUP_ALL` (see "How `Gpu::Intel::LevelZero` aggregates engine utilization"). Optional — gracefully skipped if the library isn't installed. |
 | 2 | `Gpu::Intel::Sysfs` | GT RC6/idle-residency sysfs files found under `/sys/class/drm/card*` | The practical default fix. Pure sysfs reads, no special permissions needed. |
 | 3 | `Gpu::Intel` (legacy PMU) | Only reached if both tiers above fail to initialize | Unmodified upstream code, kept byte-for-byte for upstream traceability. Only reachable on a kernel old enough to lack the GT residency sysfs files entirely (i915 predating ~2012-era kernels) — effectively a theoretical last resort on any supported system today. |
 
@@ -69,6 +69,22 @@ power cap preferred from `power1_max` → `power1_rated_max` → `power1_cap` ov
 the observed peak set the scale. Clock speed is the average of each GT's active
 frequency (falling back to the requested/current frequency when a GT is parked in
 RC6, which reads an active frequency of 0).
+
+### How `Gpu::Intel::LevelZero` aggregates engine utilization
+
+`busy%` is the **max** across all per-engine-domain samples returned by
+`zesEngineGetActivity`, deliberately **excluding `ZES_ENGINE_GROUP_ALL`**. The Intel
+Level Zero Sysman driver computes `ZES_ENGINE_GROUP_ALL` as an arithmetic average
+across all functional domains on the die (compute, 3D, copy, media decode/encode —
+~4.5 domains on a Battlemage part), so a 100%-saturated compute workload with the
+other domains idle reads ~22% instead of 100% (observed on 4x Arc B70 dGPUs, where
+the same workload reported 100% via the Sysfs tier's GT-residency arithmetic and via
+`xpu-top`). Each concrete domain group (`COMPUTE_ALL`, `RENDER_ALL`, `MEDIA_*`,
+`COPY_ALL`, plus the per-engine `_SINGLE` variants) instead reports the fraction of
+time any engine of that class was active, so the max across them matches the
+residency-based measurement regardless of which block is the active one. If a driver
+ever reports only `ZES_ENGINE_GROUP_ALL`, that sample is used as a last resort so the
+deque is never left empty.
 
 ### Why `Gpu::Intel::LevelZero` is now `dlopen`-based
 
