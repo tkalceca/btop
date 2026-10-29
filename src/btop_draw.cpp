@@ -1001,7 +1001,21 @@ namespace Cpu {
 		if (Shared::coreCount >= 100) core_width++;
 		for (const auto& n : iota(0, Shared::coreCount)) {
 			auto enabled = is_cpu_enabled(n);
-			out += Mv::to(b_y + cy + 1, b_x + cx + 1) + Theme::c(enabled ? "main_fg" : "inactive_fg") + (Shared::coreCount < 100 ? Fx::b + 'C' + Fx::ub : "")
+			#if defined(__linux__)
+			//? Intel AMX (TMUL) busy on this core — show an accented "A" badge instead
+			//? of the usual "C" prefix (or an accented core number when >= 100 cores
+			//? where the prefix is normally omitted). Same width as the "C" prefix,
+			//? so no layout shift. See INTEL_XPU.md.
+			const bool amx_active = Cpu::has_amx and enabled and safeVal(cpu.core_amx_percent, n) > 0;
+			#else
+			const bool amx_active = false;
+			#endif
+			const string core_prefix = Shared::coreCount < 100
+				? (amx_active ? Theme::c("hi_fg") + Fx::b + 'A' + Fx::ub
+							  : Theme::c(enabled ? "main_fg" : "inactive_fg") + Fx::b + 'C' + Fx::ub)
+				: (amx_active ? Theme::c("hi_fg")
+							  : Theme::c(enabled ? "main_fg" : "inactive_fg"));
+			out += Mv::to(b_y + cy + 1, b_x + cx + 1) + core_prefix
 				+ ljust(to_string(n), core_width);
 			if ((b_column_size > 0 or extra_width > 0) and cmp_less(n, core_graphs.size()))
 				out += Theme::c("inactive_fg") + graph_bg * (5 * b_column_size + extra_width) + Mv::l(5 * b_column_size + extra_width)

@@ -229,6 +229,10 @@ namespace Cpu {
 	extern string box;
 	extern int x, y, width, height, min_width, min_height;
 	extern bool shown, redraw, got_sensors, cpu_temp_only, has_battery, supports_watts;
+	//* True if Intel AMX (Advanced Matrix Extensions) monitoring is active —
+	//* AMX-capable CPU, perf_event_open of EXE.AMX_BUSY succeeded for all cores.
+	//* Only populated on Linux, see INTEL_XPU.md.
+	extern bool has_amx;
 	extern string cpuName, cpuHz;
 	extern vector<string> available_fields;
 	extern vector<string> available_sensors;
@@ -250,6 +254,9 @@ namespace Cpu {
 			{"guest_nice", {}}
 		};
 		vector<deque<long long>> core_percent;
+		//* Per-core AMX (TMUL matrix accelerator) busy percentage, valid (and
+		//* indexed like core_percent) only when has_amx is true. See INTEL_XPU.md.
+		vector<long long> core_amx_percent;
 		vector<deque<long long>> temp;
 		long long temp_max = 0;
 		array<double, 3> load_avg;
@@ -259,6 +266,10 @@ namespace Cpu {
 
 	//* Collect cpu stats and temperatures
 	auto collect(bool no_update = false) -> cpu_info&;
+
+	//* Close the AMX perf_event file descriptors (no-op if AMX monitoring is
+	//* not active). Called from clean_quit().
+	void shutdown_amx();
 
 	//* Draw contents of cpu box using <cpu> as source
     string draw(

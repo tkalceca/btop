@@ -239,6 +239,10 @@ void clean_quit(int sig) {
 	Gpu::AppleSilicon::shutdown();
 	#endif
 #endif
+	#ifdef __linux__
+	//? Close the Intel AMX (TMUL) perf_event counters, no-op if not active.
+	Cpu::shutdown_amx();
+	#endif
 
 
 	if (Config::getB("save_config_on_exit")) {

@@ -178,6 +178,12 @@ namespace Config {
 		{"cpu_sensor", 			"#* Which sensor to use for cpu temperature, use options menu to select from list of available sensors."},
 
 		{"show_coretemp", 		"#* Show temperatures for cpu cores also if check_temp is True and sensors has been found."},
+	#ifdef __linux__
+		{"show_amx",			"#* Show Intel AMX (Advanced Matrix Extensions) activity by replacing the 'C' prefix"
+								"#* of active cores with a highlighted 'A' badge in the cpu box. (Linux only)\n"
+								"#* Requires an Intel CPU with AMX (amx_tile) and PMU access (e.g. CAP_PERFMON),\n"
+								"#* auto-disabled otherwise."},
+	#endif
 
 		{"cpu_core_map",		"#* Set a custom mapping between core and coretemp, can be needed on certain cpus to get correct temperature for correct core.\n"
 								"#* Use lm-sensors or similar to see which cores are reporting temperatures on your machine.\n"
@@ -340,6 +346,9 @@ namespace Config {
 		{"check_temp", true},
 		{"show_coretemp", true},
 		{"show_cpu_freq", true},
+	#ifdef __linux__
+		{"show_amx", true},
+	#endif
 		{"background_update", true},
 		{"mem_graphs", true},
 		{"mem_below_net", false},

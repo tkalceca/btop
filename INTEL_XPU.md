@@ -261,3 +261,68 @@ and stays `"gpu-totals"` on GPU-only machines — so the default label is always
 accurate to what's actually being combined, with no manual menu action needed either
 way. Explicitly selecting either value manually always overrides this and is
 respected as picked.
+
+## Intel AMX (TMUL) core monitoring
+
+AMX (Advanced Matrix Extensions) is an on-die accelerator embedded in Intel's
+P-cores (Sapphire Rapids and newer Xeons, and client CPUs with AMX). Workloads that
+use it (OpenVINO / PyTorch / oneDNN INT8/BF16 inference, LLM prefill, GEMM-heavy
+code) can be saturated on a *subset* of cores — so a global "CPU busy%" says nothing
+about whether matrix work is actually hitting the TMUL tile units.
+
+This adds per-core AMX busy monitoring, shown as an accented **"A"** badge in place
+of the usual **"C"** core prefix in the CPU box (on >=100-core systems, where the
+prefix is normally omitted to save width, the core number itself is accented
+instead). The badge uses the theme's `hi_fg` color and the same character width as
+the "C" prefix, so the layout never shifts.
+
+### Measurement
+
+- Event: `EXE.AMX_BUSY` (EventCode `0xCE`, UMask `0x02`), which counts the cycles
+  during which the TMUL units execute matrix instructions.
+- Acquisition: one `perf_event_open()` per (logical) core, system-wide (`pid=-1`),
+  with `attr.type` read from `/sys/bus/event_source/devices/cpu/type` (falling back
+  to the legacy `/sys/devices/cpu/type`) and `attr.config` taken from a kernel-exposed
+  named event file (`.../events/exe.amx_busy`) when present, otherwise the canonical
+  raw encoding `0x02ce`.
+- Per-core busy% each tick: `ΔEXE.AMX_BUSY / ΔTSC cycles × 100` (clamped to 0–100),
+  with the TSC delta measured via `rdtsc` — the same arithmetic PCM uses when it
+  reports this event (compare the TSC column vs. the per-core event deltas in
+  `pcm-raw -tr -e EXE.AMX_BUSY` output).
+- The badge shows for **any** non-zero AMX activity in the last interval — matrix
+  instructions were executing on that core, even if briefly.
+
+### Detection & permissions (graceful degradation)
+
+AMX monitoring stays **off** (zero overhead, no crash, no log spam) when any of the
+following is true:
+
+- the `show_amx` config option (default `True`, CPU category in the options menu)
+  is `False`;
+- the CPU does not expose the `amx_tile` flag in `/proc/cpuinfo` (non-Intel, pre-AMX
+  Intel, or non-x86 builds — the PMU code path is x86-only and compiled out
+  elsewhere);
+- the core PMU type can't be read from sysfs;
+- `perf_event_open()` is **denied** (`EPERM`/`EACCES`) — e.g.
+  `/proc/sys/kernel/perf_event_paranoid` > 0 without `CAP_PERFMON`, or inside a
+  container without the capability. That is a system-wide permission problem, so
+  the whole feature disables itself (logged once at debug level).
+- no counter could be opened at all.
+
+A single core being *unavailable* (e.g. hotplugged offline, `ENODEV`) does **not**
+disable the feature — that core just keeps reporting 0 and the rest are monitored
+normally (same if a core goes offline mid-run).
+
+On a system where it is active, `btop` logs `Intel AMX monitoring active on X of N
+core(s)` at info level on startup.
+
+### Design notes
+
+- Implemented in-process (no external tool, no subprocess, no daemon) — the same
+  philosophy as the `Sysfs` and `LevelZero` tiers: btop stays self-contained and
+  degrades gracefully when the hardware/kernel doesn't cooperate.
+- The PMU event is per *logical* CPU, so SMT siblings are monitored independently
+  (one counter per logical core, matching how the rest of the CPU box works).
+- Only a per-core boolean-ish "busy in last interval" is stored
+  (`cpu_info::core_amx_percent`); no history graph is kept, keeping the tick cheap
+  (one `read()` per core + one `rdtsc`).

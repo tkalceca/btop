@@ -17,6 +17,7 @@ tab-size = 4
 */
 
 #include <algorithm>
+#include <cerrno>
 #include <charconv>
 #include <cmath>
 #include <cstdlib>
@@ -35,9 +36,11 @@ tab-size = 4
 #include <arpa/inet.h> // for inet_ntop()
 #include <dlfcn.h>
 #include <ifaddrs.h>
+#include <linux/perf_event.h> // for struct perf_event_attr, AMX PMU sampling
 #include <net/if.h>
 #include <netdb.h>
 #include <sys/statvfs.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #include <fmt/format.h>
@@ -1229,6 +1232,173 @@ namespace Cpu {
                std::views::join | std::ranges::to<std::vector<std::int32_t>>();
     }
 
+	//* ------------------------------------------------------- INTEL AMX (TMUL) ---------------------------------------------------
+	//* Per-core busy monitoring of the AMX tile matrix units via the core PMU event
+	//* EXE.AMX_BUSY, sampled in-process with perf_event_open. See INTEL_XPU.md.
+	//*
+	//* AMX is an on-die accelerator embedded in Intel's P-cores (Sapphire Rapids and
+	//* newer Xeons, and client cpus with AMX). The PMU event counts the cycles during
+	//* which the TMUL units execute matrix instructions; dividing the per-core delta
+	//* by the TSC cycles elapsed in the same interval gives the per-core AMX busy%,
+	//* the same arithmetic PCM uses for this event.
+	//*
+	//* Gracefully disabled (has_amx stays false) when:
+	//*   - "show_amx" is false
+	//*   - the cpu does not expose the amx_tile flag in /proc/cpuinfo
+	//*   - perf_event_open is denied (perf_event_paranoid, no CAP_PERFMON, container)
+
+	bool has_amx = false;
+
+	//* Everything below is x86-only (AMX + rdtsc); on other architectures has_amx
+	//* simply stays false and all of this is compiled out.
+	#if defined(__x86_64__) or defined(__i386__)
+		static vector<int> amx_fds = {};
+		static vector<uint64_t> amx_prev_counts = {};
+		static uint64_t amx_prev_tsc = 0;
+		static bool amx_init_attempted = false;
+
+		static inline uint64_t amx_rdtsc() {
+			return __builtin_ia32_rdtsc();
+		}
+
+		#ifndef __NR_perf_event_open
+			#if defined(__x86_64__)
+				#define __NR_perf_event_open 298
+			#else // __i386__
+				#define __NR_perf_event_open 336
+			#endif
+		#endif
+
+		//* Open a system-wide (all processes on <cpu>) core PMU counter.
+		static int amx_perf_event_open(uint64_t pmu_type, uint64_t config, int cpu) {
+			struct perf_event_attr attr = {};
+			attr.type = pmu_type;
+			attr.size = sizeof(attr);
+			attr.config = config;
+			return syscall(__NR_perf_event_open, &attr, -1, cpu, -1, PERF_FLAG_FD_CLOEXEC);
+		}
+
+		//* The core PMU's type id, needed as attr.type for perf_event_open.
+		static uint64_t amx_cpu_pmu_type() {
+			for (const fs::path p : { "/sys/bus/event_source/devices/cpu/type", "/sys/devices/cpu/type" }) {
+				try {
+					if (fs::exists(p))
+						return (uint64_t)std::stoull(readfile(p, "0"), nullptr, 0);
+				} catch (const std::exception&) {}
+			}
+			return 0;
+		}
+
+		//* Raw config for EXE.AMX_BUSY (EventCode 0xCE, UMask 0x02, i.e. 0x02ce).
+		//* Prefer a kernel-exposed named event file when present so the value always
+		//* matches what the kernel's event decoder expects for this cpu.
+		static uint64_t amx_event_config() {
+			for (const fs::path p : { "/sys/bus/event_source/devices/cpu/events/exe.amx_busy",
+					"/sys/devices/cpu/events/exe.amx_busy" }) {
+				try {
+					if (fs::exists(p)) {
+						const uint64_t cfg = (uint64_t)std::stoull(readfile(p, "0"), nullptr, 0);
+						if (cfg != 0) return cfg;
+					}
+				} catch (const std::exception&) {}
+			}
+			return 0x02ce;
+		}
+
+		//* One-time init: open one EXE.AMX_BUSY counter per core and take a baseline.
+		//* Any failure leaves has_amx false so the rest of btop is unaffected.
+		static void amx_init(int core_count) {
+			if (not Config::getB("show_amx")) return;
+
+			//? Must be an Intel cpu with the AMX tile matrix units (amx_tile cpu flag).
+			{
+				ifstream cpuinfo(Shared::procPath / "cpuinfo");
+				if (not cpuinfo.good()) return;
+				bool amx = false;
+				for (string line; getline(cpuinfo, line) and not amx;) {
+					if (line.starts_with("flags") and (line.contains(" amx_tile") or line.ends_with("amx_tile")))
+						amx = true;
+				}
+				if (not amx) return;
+			}
+
+			const uint64_t pmu_type = amx_cpu_pmu_type();
+			if (pmu_type == 0) {
+				Logger::debug("AMX: could not read the core pmu type, AMX monitoring disabled");
+				return;
+			}
+			const uint64_t config = amx_event_config();
+
+			amx_fds.assign(core_count, -1);
+			int opened = 0;
+			for (int i = 0; i < core_count; ++i) {
+				amx_fds[i] = amx_perf_event_open(pmu_type, config, i);
+				if (amx_fds[i] < 0) {
+					if (errno == EPERM or errno == EACCES) {
+						Logger::debug("AMX: perf_event_open denied (errno {}), AMX monitoring disabled — "
+							"raise /proc/sys/kernel/perf_event_paranoid or grant CAP_PERFMON", errno);
+						shutdown_amx();
+						return;
+					}
+					//? Core offline or otherwise unavailable — stays -1, reports 0.
+					continue;
+				}
+				++opened;
+			}
+			if (opened == 0) {
+				Logger::debug("AMX: could not open any EXE.AMX_BUSY counters, AMX monitoring disabled");
+				shutdown_amx();
+				return;
+			}
+			amx_prev_counts.assign(core_count, 0);
+			for (int i = 0; i < core_count; ++i) {
+				if (amx_fds[i] < 0) continue;
+				uint64_t base = 0;
+				if (read(amx_fds[i], &base, sizeof(base)) != (ssize_t)sizeof(base)) {
+					shutdown_amx();
+					return;
+				}
+				amx_prev_counts[i] = base;
+			}
+			amx_prev_tsc = amx_rdtsc();
+			has_amx = true;
+			Logger::info("Intel AMX monitoring active on {} of {} core(s)", opened, core_count);
+		}
+
+		//* Per-tick sampling: per-core AMX busy% = ΔEXE.AMX_BUSY / ΔTSC cycles.
+		static void amx_update(cpu_info& cpu) {
+			const uint64_t tsc = amx_rdtsc();
+			const uint64_t delta_tsc = tsc - amx_prev_tsc;
+			for (size_t i = 0; i < amx_fds.size() and i < cpu.core_amx_percent.size(); ++i) {
+				if (amx_fds[i] < 0)
+					continue; //? core was unavailable at init — stays 0
+				uint64_t count = 0;
+				if (read(amx_fds[i], &count, sizeof(count)) != (ssize_t)sizeof(count))
+					continue; //? e.g. core hotplugged offline mid-run — stays 0 for this tick
+				const uint64_t delta_amx = (count >= amx_prev_counts[i]) ? count - amx_prev_counts[i] : 0;
+				amx_prev_counts[i] = count;
+				cpu.core_amx_percent[i] = (delta_tsc > 0)
+					? clamp((long long)round((double)delta_amx * 100.0 / (double)delta_tsc), 0ll, 100ll)
+					: 0;
+			}
+			amx_prev_tsc = tsc;
+		}
+	#endif
+
+	//* Close all AMX counters and reset state. No-op if AMX monitoring is not active.
+	//* Also allows a re-init attempt (e.g. after "show_amx" is re-enabled).
+	void shutdown_amx() {
+		#if defined(__x86_64__) or defined(__i386__)
+		for (const int fd : amx_fds)
+			if (fd >= 0) ::close(fd);
+		amx_fds.clear();
+		amx_prev_counts.clear();
+		amx_prev_tsc = 0;
+		amx_init_attempted = false;
+		#endif
+		has_amx = false;
+	}
+
 	auto collect(bool no_update) -> cpu_info& {
 		if (Runner::stopping or (no_update and not current_cpu.cpu_percent.at("total").empty())) return current_cpu;
 		auto& cpu = current_cpu;
@@ -1368,6 +1538,22 @@ namespace Cpu {
 
 		if (Config::getB("show_cpu_watts") and supports_watts)
 			current_cpu.usage_watts = get_cpuConsumptionWatts();
+
+		//? Intel AMX (TMUL) busy sampling — lazy init after the core count was
+		//? finalized by the /proc/stat parse above, see INTEL_XPU.md.
+		#if defined(__x86_64__) or defined(__i386__)
+		if (has_amx and not Config::getB("show_amx"))
+			shutdown_amx(); //? runtime toggle off — stop monitoring
+		if (Config::getB("show_amx") and not has_amx and not amx_init_attempted) {
+			amx_init_attempted = true;
+			amx_init((int)cpu.core_percent.size());
+		}
+		if (has_amx) {
+			//? Seed zeros for any cores beyond our counter range (e.g. hotplug) first.
+			cpu.core_amx_percent.assign(cpu.core_percent.size(), 0);
+			amx_update(cpu);
+		}
+		#endif
 
 		cpu.active_cpus = std::make_optional(detect_active_cpus());
 
