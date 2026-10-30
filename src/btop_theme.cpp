@@ -98,6 +98,9 @@ namespace Theme {
 		{ "proc_banner_fg", "#ee"},
 		{ "followed_bg", "#4040b5"},
 		{ "followed_fg", "#ee"},
+		//? Solid accent gradient (start only, no end) used to tint the CPU
+		//? graphs while Intel AMX (TMUL) units are active. See INTEL_XPU.md.
+		{ "amx_start", "#b54040" },
 	};
 
 	const std::unordered_map<string, string> TTY_theme = {
@@ -149,6 +152,11 @@ namespace Theme {
 		{ "proc_banner_fg", "\x1b[97m" },
 		{ "followed_bg", "\x1b[44m" },
 		{ "followed_fg", "\x1b[97m" },
+		//? Solid accent gradient used to tint the CPU graphs while Intel AMX
+		//? (TMUL) units are active (same value as hi_fg). See INTEL_XPU.md.
+		{ "amx_start", "\x1b[91m" },
+		{ "amx_mid", "" },
+		{ "amx_end", "\x1b[91m" },
 	};
 
 	namespace {
@@ -311,10 +319,15 @@ namespace Theme {
 			rgbs.insert({
 				{ "proc_start", 		rgbs["main_fg"]			},
 				{ "proc_mid", 			{-1, -1, -1}			},
-				{ "proc_end", 			rgbs["inactive_fg"]		},
+				{ "proc_end", 			rgbs["inactive_fg"]	},
 				{ "proc_color_start", 	rgbs["inactive_fg"]		},
 				{ "proc_color_mid", 	{-1, -1, -1}			},
 				{ "proc_color_end", 	rgbs["process_start"]	},
+				//? AMX accent gradient is start-only by default (solid hi_fg tint) —
+				//? mark mid/end undefined so the solid fill branch is used unless a
+				//? theme file provides custom amx_mid/amx_end values.
+				{ "amx_mid", 			{-1, -1, -1}			},
+				{ "amx_end", 			{-1, -1, -1}			},
 			});
 
 			for (const auto& [name, source_arr] : rgbs) {

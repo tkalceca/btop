@@ -419,7 +419,9 @@ namespace Draw {
 	}
 
 	//* Graph class ------------------------------------------------------------------------------------------------------------>
-	void Graph::_create(const deque<long long>& data, int data_offset) {
+	void Graph::_create(const deque<long long>& data, int data_offset, const string& gradient_override) {
+		//? <gradient_override> (if given) replaces the graph's own gradient for this frame
+		const string& grad = gradient_override.empty() ? color_gradient : gradient_override;
 		bool mult = (data.size() - data_offset > 1);
 		const auto& graph_symbol = Symbols::graph_symbols.at(symbol + '_' + (invert ? "down" : "up"));
 		array<int, 2> result;
@@ -462,7 +464,7 @@ namespace Draw {
 				if (height == 1) {
 					if (result.at(0) + result.at(1) == 0) graphs.at(current).at(horizon) += Mv::r(1);
 					else {
-						if (not color_gradient.empty()) graphs.at(current).at(horizon) += Theme::g(color_gradient).at(clamp(max(last, data_value), 0ll, 100ll));
+						if (not grad.empty()) graphs.at(current).at(horizon) += Theme::g(grad).at(clamp(max(last, data_value), 0ll, 100ll));
 						graphs.at(current).at(horizon) += graph_symbol.at((result.at(0) * 5 + result.at(1)));
 					}
 				}
@@ -480,12 +482,12 @@ namespace Draw {
 		else {
 			for (const int& i : iota(1, height + 1)) {
 				if (i > 1) out += Mv::d(1) + Mv::l(width);
-				if (not color_gradient.empty())
-					out += (invert) ? Theme::g(color_gradient).at(i * 100 / height) : Theme::g(color_gradient).at(100 - ((i - 1) * 100 / height));
+				if (not grad.empty())
+					out += (invert) ? Theme::g(grad).at(i * 100 / height) : Theme::g(grad).at(100 - ((i - 1) * 100 / height));
 				out += (invert) ? graphs.at(current).at(height - i) : graphs.at(current).at(i-1);
 			}
 		}
-		if (not color_gradient.empty()) out += Fx::reset;
+		if (not grad.empty()) out += Fx::reset;
 	}
 
 	Graph::Graph() {}
@@ -518,7 +520,7 @@ namespace Draw {
 		this->_create(data, data_offset);
 	}
 
-	string& Graph::operator()(const deque<long long>& data, bool data_same) {
+	string& Graph::operator()(const deque<long long>& data, bool data_same, const string& gradient_override) {
 		if (data_same) return out;
 
 		//? Make room for new characters on graph
@@ -531,7 +533,7 @@ namespace Draw {
 			else if (graphs.at(current).at(i).at(0) == ' ') graphs.at(current).at(i).erase(0, 1);
 			else graphs.at(current).at(i).erase(0, 3);
 		}
-		this->_create(data, (int)data.size() - 1);
+		this->_create(data, (int)data.size() - 1, gradient_override);
 		return out;
 	}
 
@@ -592,6 +594,17 @@ namespace Cpu {
 		//? just mean "show whenever at least one NPU was detected".
 		const bool show_npu = (npus.size() > 0 and Config::getS("show_npu_info") != "Off");
 #endif // GPU_SUPPORT
+		//* Intel AMX (TMUL) active on any core in the last interval — used to tint the
+		//* CPU graphs with the "amx" accent gradient and switch the C/A indicators.
+		//* See INTEL_XPU.md.
+		#if defined(__linux__)
+		const bool amx_any_active = Cpu::has_amx and not cpu.core_amx_percent.empty()
+			and std::ranges::any_of(cpu.core_amx_percent, [](const long long& p) { return p > 0; });
+		const string amx_gradient = amx_any_active ? "amx" : "";
+		#else
+		const bool amx_any_active = false;
+		const string amx_gradient = "";
+		#endif
 		auto graph_up_field = Config::getS("cpu_graph_upper");
 		if (graph_up_field == "Auto" or not v_contains(Cpu::available_fields, graph_up_field))
 			graph_up_field = "total";
@@ -920,19 +933,30 @@ namespace Cpu {
 					}
 					else
 						out += graphs[0](safeVal(Gpu::shared_gpu_percent, graph_field), (data_same or redraw));
-				else
-			#else
-				(void)graph_height;
-				(void)graph_width;
-			#endif
-					out += graphs[0](safeVal(cpu.cpu_percent, graph_field), (data_same or redraw));
-			};
+			else
+		#else
+			(void)graph_height;
+			(void)graph_width;
+		#endif
+				//? <amx_gradient> tints the CPU graph with the AMX accent color while
+				//? any core has active TMUL usage; empty string keeps the default "cpu"
+				//? gradient (Graph::operator() falls back to its own gradient).
+				out += graphs[0](safeVal(cpu.cpu_percent, graph_field), (data_same or redraw), amx_gradient);
+		};
 
 			draw_graphs(graphs_upper, graph_up_height, graph_up_width, actual_up_field);
 			if (not single_graph) {
 				out += Mv::to(y + graph_up_height + 1 + mid_line, x + 1);
 				draw_graphs(graphs_lower, graph_low_height, graph_low_width, actual_lo_field);
 			}
+
+			//* C/A indicator in the top-left corner of the CPU graphs: a dim "C" for
+			//* standard CPU load, a highlighted "A" while AMX (TMUL) units are active
+			//* on any core (the graphs themselves are tinted with the "amx" gradient
+			//* at the same time). See INTEL_XPU.md.
+			out += Mv::to(y + 1, x + 1)
+				+ (amx_any_active ? Theme::c("selected_bg") + Theme::c("selected_fg") + Fx::b + 'A' + Fx::ub
+								  : Theme::c("inactive_fg") + 'C');
 
 			//? Uptime
 			if (Config::getB("show_uptime")) {
@@ -957,7 +981,9 @@ namespace Cpu {
 					+ Symbols::h_line * ((freq_range ? 17 : 7) - cpuHz.size())
 					+ Symbols::title_left + Fx::b + Theme::c("title") + cpuHz + Fx::ub + Theme::c("div_line") + Symbols::title_right;
 
-			out += Mv::to(b_y + 1, b_x + 1) + Theme::c("main_fg") + Fx::b + "CPU " + cpu_meter(safeVal(cpu.cpu_percent, "total"s).back())
+			//* "CPU " label switches to a highlighted "AMX " while any core has active
+			//* TMUL usage — same width, so the meter does not shift.
+			out += Mv::to(b_y + 1, b_x + 1) + (amx_any_active ? Theme::c("hi_fg") : Theme::c("main_fg")) + Fx::b + (amx_any_active ? "AMX " : "CPU ") + cpu_meter(safeVal(cpu.cpu_percent, "total"s).back())
 				+ Theme::g("cpu").at(clamp(safeVal(cpu.cpu_percent, "total"s).back(), 0ll, 100ll)) + rjust(to_string(safeVal(cpu.cpu_percent, "total"s).back()), 4) + Theme::c("main_fg") + '%';
 			if (show_temps) {
 				const auto [temp, unit] = celsius_to(safeVal(cpu.temp, 0).back(), temp_scale);
@@ -1010,13 +1036,19 @@ namespace Cpu {
 			#else
 			const bool amx_active = false;
 			#endif
+			//* < 100 cores: "C" prefix swaps to a bold highlighted "A" when active.
+			//* >= 100 cores: the prefix letter is omitted in btop's core grid to fit
+			//* 3-digit core numbers, so the core number itself becomes a high-contrast
+			//* inverted badge (selected_bg + selected_fg, same combo btop uses for
+			//* selected menu items) — visible even in a dense 192-core grid.
 			const string core_prefix = Shared::coreCount < 100
 				? (amx_active ? Theme::c("hi_fg") + Fx::b + 'A' + Fx::ub
 							  : Theme::c(enabled ? "main_fg" : "inactive_fg") + Fx::b + 'C' + Fx::ub)
-				: (amx_active ? Theme::c("hi_fg")
+				: (amx_active ? Theme::c("selected_bg") + Theme::c("selected_fg") + Fx::b
 							  : Theme::c(enabled ? "main_fg" : "inactive_fg"));
 			out += Mv::to(b_y + cy + 1, b_x + cx + 1) + core_prefix
-				+ ljust(to_string(n), core_width);
+				+ ljust(to_string(n), core_width)
+				+ (amx_active and Shared::coreCount >= 100 ? Fx::ub : "");
 			if ((b_column_size > 0 or extra_width > 0) and cmp_less(n, core_graphs.size()))
 				out += Theme::c("inactive_fg") + graph_bg * (5 * b_column_size + extra_width) + Mv::l(5 * b_column_size + extra_width)
 					+ core_graphs.at(n)(safeVal(cpu.core_percent, n), data_same or redraw);

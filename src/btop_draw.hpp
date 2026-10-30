@@ -112,7 +112,10 @@ namespace Draw {
 		std::unordered_map<bool, vector<string>> graphs = { {true, {}}, {false, {}}};
 
 		//* Create two representations of the graph to switch between to represent two values for each braille character
-		void _create(const deque<long long>& data, int data_offset);
+		//* <gradient_override> (optional) replaces the graph's own color_gradient for this
+		//* frame only, e.g. to tint the CPU graphs with the AMX accent color while
+		//* AMX (TMUL) units are active. See INTEL_XPU.md.
+		void _create(const deque<long long>& data, int data_offset, const string& gradient_override="");
 
 	public:
 		Graph();
@@ -124,7 +127,7 @@ namespace Draw {
 			long long max_value=0, long long offset=0);
 
 		//* Add last value from back of <data> and return string representation of graph
-		string& operator()(const deque<long long>& data, bool data_same=false);
+		string& operator()(const deque<long long>& data, bool data_same=false, const string& gradient_override="");
 
 		//* Return string representation of graph
 		string& operator()();

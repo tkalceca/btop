@@ -1270,11 +1270,15 @@ namespace Cpu {
 		#endif
 
 		//* Open a system-wide (all processes on <cpu>) core PMU counter.
+		//* AMX matrix instructions are pure userspace workload, so kernel and
+		//* hypervisor executions are excluded — no kernel counters needed.
 		static int amx_perf_event_open(uint64_t pmu_type, uint64_t config, int cpu) {
 			struct perf_event_attr attr = {};
 			attr.type = pmu_type;
 			attr.size = sizeof(attr);
 			attr.config = config;
+			attr.exclude_kernel = 1;
+			attr.exclude_hv = 1;
 			return syscall(__NR_perf_event_open, &attr, -1, cpu, -1, PERF_FLAG_FD_CLOEXEC);
 		}
 
@@ -1377,9 +1381,11 @@ namespace Cpu {
 					continue; //? e.g. core hotplugged offline mid-run — stays 0 for this tick
 				const uint64_t delta_amx = (count >= amx_prev_counts[i]) ? count - amx_prev_counts[i] : 0;
 				amx_prev_counts[i] = count;
-				cpu.core_amx_percent[i] = (delta_tsc > 0)
-					? clamp((long long)round((double)delta_amx * 100.0 / (double)delta_tsc), 0ll, 100ll)
-					: 0;
+				//? Any detected matrix instruction registers as at least 1% so short
+				//? AMX bursts do not round down to zero and hide the TUI indicators.
+				cpu.core_amx_percent[i] = (delta_amx == 0 or delta_tsc == 0)
+					? 0
+					: max(1ll, clamp((long long)round((double)delta_amx * 100.0 / (double)delta_tsc), 0ll, 100ll));
 			}
 			amx_prev_tsc = tsc;
 		}
