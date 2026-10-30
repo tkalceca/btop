@@ -955,7 +955,7 @@ namespace Cpu {
 			//* on any core (the graphs themselves are tinted with the "amx" gradient
 			//* at the same time). See INTEL_XPU.md.
 			out += Mv::to(y + 1, x + 1)
-				+ (amx_any_active ? Theme::c("selected_bg") + Theme::c("selected_fg") + Fx::b + 'A' + Fx::ub
+				+ (amx_any_active ? Theme::c("selected_bg") + Theme::c("selected_fg") + Fx::b + 'A' + Fx::reset
 								  : Theme::c("inactive_fg") + 'C');
 
 			//? Uptime
@@ -1048,7 +1048,7 @@ namespace Cpu {
 							  : Theme::c(enabled ? "main_fg" : "inactive_fg"));
 			out += Mv::to(b_y + cy + 1, b_x + cx + 1) + core_prefix
 				+ ljust(to_string(n), core_width)
-				+ (amx_active and Shared::coreCount >= 100 ? Fx::ub : "");
+				+ (amx_active and Shared::coreCount >= 100 ? Fx::reset : "");
 			if ((b_column_size > 0 or extra_width > 0) and cmp_less(n, core_graphs.size()))
 				out += Theme::c("inactive_fg") + graph_bg * (5 * b_column_size + extra_width) + Mv::l(5 * b_column_size + extra_width)
 					+ core_graphs.at(n)(safeVal(cpu.core_percent, n), data_same or redraw);

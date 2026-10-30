@@ -8,10 +8,17 @@ cd btop
 sudo apt update
 sudo apt install gcc-14 g++-14 -y
 sudo apt install cmake ninja-build lowdown -y
+
+# CPU Only
+cmake -B build -G Ninja \
+-DUSE_LEVELZERO=OFF \
+-DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_C_COMPILER=gcc-14 \
+-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
+
+# XPU
 # PLEASE FOLLOW:
 # https://dgpu-docs.intel.com/installation-guides/installing-packages-from-the-intel-ppa.html
 sudo apt install libze-dev
-
 # This should automatically use -DUSE_LEVELZERO=ON (level-zero required!)
 # otherwise, switch it off via -DUSE_LEVELZERO=OFF (not verified)
 cmake -B build -G Ninja \
@@ -21,13 +28,13 @@ cmake -B build -G Ninja \
 cmake --build build
 
 # LOCAL
-./build/btop
+sudo ./build/btop
 
 #GLOBAL
 sudo apt remove btop
 sudo cmake --install build
 # run / exec
-btop
+sudo btop
 # uninstall
 sudo xargs rm < build/install_manifest.txt
 ```
@@ -270,11 +277,26 @@ use it (OpenVINO / PyTorch / oneDNN INT8/BF16 inference, LLM prefill, GEMM-heavy
 code) can be saturated on a *subset* of cores — so a global "CPU busy%" says nothing
 about whether matrix work is actually hitting the TMUL tile units.
 
-This adds per-core AMX busy monitoring, shown as an accented **"A"** badge in place
-of the usual **"C"** core prefix in the CPU box (on >=100-core systems, where the
-prefix is normally omitted to save width, the core number itself is accented
-instead). The badge uses the theme's `hi_fg` color and the same character width as
-the "C" prefix, so the layout never shifts.
+This adds per-core AMX busy monitoring with several synchronized indicators in the
+CPU box:
+
+- **Per-core grid** — an active core shows a bold accented **"A"** badge in place
+  of the usual **"C"** core prefix (`hi_fg`, same character width, no layout shift).
+  On >=100-core systems, where btop omits the prefix letter to fit 3-digit core
+  numbers, the core number itself becomes a **high-contrast inverted badge**
+  (`selected_bg` + `selected_fg`, bold — the same combo btop uses for selected
+  menu items), so it stands out even in a dense 192-core grid.
+- **CPU graphs over time** — while *any* core has active AMX usage, the CPU
+  utilization graphs are tinted with a dedicated **"amx" accent gradient**
+  (solid `hi_fg` color by default, overridable per theme via the `amx_start`
+  color), and a small **"C" / "A"** indicator in the top-left corner of the graph
+  area switches from a dim `C` (standard CPU load) to a highlighted `A`.
+- **CPU meter label** — the `"CPU "` label in front of the total meter bar switches
+  to a highlighted `"AMX "` while any core has active TMUL usage (same width, no
+  meter shift).
+
+All indicators share the same trigger: at least one core with non-zero AMX busy%
+in the last update interval (see Measurement).
 
 ### Measurement
 
@@ -282,15 +304,30 @@ the "C" prefix, so the layout never shifts.
   during which the TMUL units execute matrix instructions.
 - Acquisition: one `perf_event_open()` per (logical) core, system-wide (`pid=-1`),
   with `attr.type` read from `/sys/bus/event_source/devices/cpu/type` (falling back
-  to the legacy `/sys/devices/cpu/type`) and `attr.config` taken from a kernel-exposed
-  named event file (`.../events/exe.amx_busy`) when present, otherwise the canonical
-  raw encoding `0x02ce`.
+  to the legacy `/sys/devices/cpu/type`) and the perf `exclude_*` filters cleared.
+  The `EventCode`/`UMask` come from a kernel-exposed named event file
+  (`.../events/exe.amx_busy`) when present, otherwise the canonical SPR/EMR
+  encoding. Kernels differ in which bits of the `IA32_PERFEVTSEL` register they
+  accept in `attr.config`, so the config is negotiated on core 0 by trying three
+  encodings in order: (1) PCM's full form `(1<<63) | reg` with `User` (bit 16),
+  `OS` (bit 17) and `Enable` (bit 22) set — i.e. `0x80000000004302ce` by default —
+  (2) the bare register value `0x4302ce`, and (3) the plain raw event code
+  `0x02ce`, which stock kernels decode themselves and program USR/OS/Enable for
+  (the same config `perf stat -e r02ce` uses). The first encoding the kernel
+  accepts is used for all cores.
 - Per-core busy% each tick: `ΔEXE.AMX_BUSY / ΔTSC cycles × 100` (clamped to 0–100),
   with the TSC delta measured via `rdtsc` — the same arithmetic PCM uses when it
   reports this event (compare the TSC column vs. the per-core event deltas in
   `pcm-raw -tr -e EXE.AMX_BUSY` output).
-- The badge shows for **any** non-zero AMX activity in the last interval — matrix
-  instructions were executing on that core, even if briefly.
+- Privilege filtering: the `User`/`OS` bits are set in the register value when the
+  kernel accepts them, and otherwise derived by the kernel from the (cleared) perf
+  `exclude_user`/`exclude_kernel`/`exclude_hv` filters — either way both user and
+  kernel mode are counted, matching PCM. The kernel never executes AMX (a
+  userspace-only feature), so counting every mode adds no noise.
+- The indicators show for **any** non-zero AMX activity in the last interval —
+  matrix instructions were executing on that core, even if briefly. Any non-zero
+  delta registers as at least 1% busy so short bursts (sub-0.5% of the interval)
+  do not round down to zero and hide the indicator.
 
 ### Detection & permissions (graceful degradation)
 
@@ -324,5 +361,9 @@ core(s)` at info level on startup.
 - The PMU event is per *logical* CPU, so SMT siblings are monitored independently
   (one counter per logical core, matching how the rest of the CPU box works).
 - Only a per-core boolean-ish "busy in last interval" is stored
-  (`cpu_info::core_amx_percent`); no history graph is kept, keeping the tick cheap
-  (one `read()` per core + one `rdtsc`).
+  (`cpu_info::core_amx_percent`); no AMX-specific history is kept, keeping the tick
+  cheap (one `read()` per core + one `rdtsc`). The graph tinting reuses the
+  existing CPU utilization history and only switches its gradient per frame.
+- The AMX accent color is a regular theme color: themes can set `amx_start`
+  (e.g. `[amx_start] = "#ff00ff"`) to change the graph tint / badge accent. When a
+  theme does not define it, it falls back to the theme's `hi_fg` value.

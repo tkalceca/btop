@@ -1258,6 +1258,7 @@ namespace Cpu {
 		static uint64_t amx_prev_tsc = 0;
 		static bool amx_init_attempted = false;
 		static bool amx_activity_logged = false;
+		static bool amx_first_tick_logged = false;
 
 		static inline uint64_t amx_rdtsc() {
 			return __builtin_ia32_rdtsc();
@@ -1374,13 +1375,23 @@ namespace Cpu {
 
 			amx_fds.assign(core_count, -1);
 
-			//? Negotiate the perf config on core 0 first: use PCM's bit-63
-			//? encoding, and if the kernel rejects it fall back to the bare
-			//? register value. Both carry the USR/OS/Enable bits that make
-			//? the counter actually increment.
-			uint64_t config = (1ULL << 63ULL) | reg_value;
-			int test_fd = amx_perf_event_open(pmu_type, config, 0);
-			if (test_fd < 0) {
+			//? Negotiate the perf config on core 0 first. Different kernel
+			//? versions accept different subsets of the event-select register
+			//? bits, so try three encodings in order:
+			//?   1. PCM's full encoding (bit 63 + USR/OS/Enable bits)
+			//?   2. the bare event-select register value (USR/OS/Enable bits)
+			//?   3. the plain raw event code (0x02ce) that the kernel decodes
+			//?      itself and programs USR/OS/Enable for — what
+			//?      `perf stat -e r02ce` uses on stock kernels.
+			uint64_t config = 0;
+			int test_fd = -1;
+			for (const uint64_t candidate : { (uint64_t)((1ULL << 63ULL) | reg_value), reg_value,
+					(uint64_t)(reg_value & 0xffffULL) }) {
+				test_fd = amx_perf_event_open(pmu_type, candidate, 0);
+				if (test_fd >= 0) {
+					config = candidate;
+					break;
+				}
 				const int err = errno;
 				if (err == EPERM or err == EACCES) {
 					Logger::debug("AMX: perf_event_open denied (errno {}), AMX monitoring disabled — "
@@ -1388,13 +1399,12 @@ namespace Cpu {
 					shutdown_amx();
 					return;
 				}
-				config = reg_value;
-				test_fd = amx_perf_event_open(pmu_type, config, 0);
-				if (test_fd < 0) {
-					Logger::debug("AMX: perf_event_open failed (errno {}), AMX monitoring disabled", errno);
-					shutdown_amx();
-					return;
-				}
+			}
+			if (test_fd < 0) {
+				Logger::debug("AMX: perf_event_open rejected every event encoding (errno {}), "
+					"AMX monitoring disabled", errno);
+				shutdown_amx();
+				return;
 			}
 			amx_fds[0] = test_fd;
 			Logger::debug("AMX: negotiated pmu type {}, event config 0x{:x}", pmu_type, config);
@@ -1447,6 +1457,13 @@ namespace Cpu {
 					continue; //? e.g. core hotplugged offline mid-run — stays 0 for this tick
 				const uint64_t delta_amx = (count >= amx_prev_counts[i]) ? count - amx_prev_counts[i] : 0;
 				amx_prev_counts[i] = count;
+				//? One-shot tick-1 diagnostic: shows immediately whether the
+				//? counter is accumulating at all during remote testing.
+				if (not amx_first_tick_logged) {
+					amx_first_tick_logged = true;
+					Logger::debug("AMX: first sample core {}: count={} delta={} delta_tsc={}",
+						i, count, delta_amx, delta_tsc);
+				}
 				//? Any detected matrix instruction registers as at least 1% so short
 				//? AMX bursts do not round down to zero and hide the TUI indicators.
 				const long long pct = (delta_amx == 0 or delta_tsc == 0)
@@ -1475,6 +1492,7 @@ namespace Cpu {
 		amx_prev_tsc = 0;
 		amx_init_attempted = false;
 		amx_activity_logged = false;
+		amx_first_tick_logged = false;
 		#endif
 		has_amx = false;
 	}
