@@ -17,6 +17,7 @@ tab-size = 4
 */
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <charconv>
 #include <cmath>
@@ -1256,6 +1257,7 @@ namespace Cpu {
 		static vector<uint64_t> amx_prev_counts = {};
 		static uint64_t amx_prev_tsc = 0;
 		static bool amx_init_attempted = false;
+		static bool amx_activity_logged = false;
 
 		static inline uint64_t amx_rdtsc() {
 			return __builtin_ia32_rdtsc();
@@ -1270,15 +1272,20 @@ namespace Cpu {
 		#endif
 
 		//* Open a system-wide (all processes on <cpu>) core PMU counter.
-		//* AMX matrix instructions are pure userspace workload, so kernel and
-		//* hypervisor executions are excluded — no kernel counters needed.
+		//* Privilege filtering is done via the USR/OS bits baked into `config`
+		//* (matching Intel PCM), so exclude_user/exclude_kernel/exclude_hv are
+		//* left cleared — otherwise the kernel would strip the OS/USR bits out
+		//* of the programmed MSR and the counter would never increment.
 		static int amx_perf_event_open(uint64_t pmu_type, uint64_t config, int cpu) {
 			struct perf_event_attr attr = {};
 			attr.type = pmu_type;
 			attr.size = sizeof(attr);
 			attr.config = config;
-			attr.exclude_kernel = 1;
-			attr.exclude_hv = 1;
+			attr.exclude_user = 0;
+			attr.exclude_kernel = 0;
+			attr.exclude_hv = 0;
+			attr.read_format = 0;
+			attr.disabled = 0;
 			return syscall(__NR_perf_event_open, &attr, -1, cpu, -1, PERF_FLAG_FD_CLOEXEC);
 		}
 
@@ -1293,20 +1300,52 @@ namespace Cpu {
 			return 0;
 		}
 
-		//* Raw config for EXE.AMX_BUSY (EventCode 0xCE, UMask 0x02, i.e. 0x02ce).
-		//* Prefer a kernel-exposed named event file when present so the value always
-		//* matches what the kernel's event decoder expects for this cpu.
+		//* Build the IA32_PERFEVTSEL register value for EXE.AMX_BUSY, matching Intel
+		//* PCM's encoding: EventCode (bits 0-7), UMask (bits 8-15), User (bit 16),
+		//* OS (bit 17) and Enable (bit 22). Both User and OS are set so the PMU
+		//* counts in every mode — the kernel never executes AMX (a userspace-only
+		//* feature), so this adds no noise. Default (SPR/EMR) is 0x4302ce.
 		static uint64_t amx_event_config() {
+			constexpr uint64_t kEvent = 0xce;
+			constexpr uint64_t kUmask = 0x02;
+			constexpr uint64_t kUsr   = 1ULL << 16;
+			constexpr uint64_t kOs    = 1ULL << 17;
+			constexpr uint64_t kEn    = 1ULL << 22;
+
+			//? Parse a hex field ("name=0x..") from the kernel's event text.
+			auto field = [](const string& s, const string& name) -> std::optional<uint64_t> {
+				const size_t pos = s.find(name + "=0x");
+				if (pos == string::npos) return std::nullopt;
+				const size_t start = pos + name.size() + 3;
+				size_t i = start;
+				uint64_t v = 0;
+				while (i < s.size() and isxdigit((unsigned char)s[i])) {
+					const char c = s[i];
+					const int d = (c >= '0' and c <= '9') ? c - '0'
+						: (c >= 'a' and c <= 'f') ? c - 'a' + 10
+						: c - 'A' + 10;
+					v = (v << 4) | (uint64_t)d;
+					++i;
+				}
+				if (i > start) return v;
+				return std::nullopt;
+			};
+
+			//? Prefer a kernel-exposed named event file when present so the
+			//? EventCode/UMask always match this cpu's kernel decoder.
 			for (const fs::path p : { "/sys/bus/event_source/devices/cpu/events/exe.amx_busy",
 					"/sys/devices/cpu/events/exe.amx_busy" }) {
 				try {
 					if (fs::exists(p)) {
-						const uint64_t cfg = (uint64_t)std::stoull(readfile(p, "0"), nullptr, 0);
-						if (cfg != 0) return cfg;
+						const string s = readfile(p, "");
+						const auto ev = field(s, "event");
+						const auto um = field(s, "umask");
+						if (ev.has_value() or um.has_value())
+							return (um.value_or(kUmask) << 8) | (ev.value_or(kEvent) & 0xff) | kUsr | kOs | kEn;
 					}
 				} catch (const std::exception&) {}
 			}
-			return 0x02ce;
+			return (kUmask << 8) | kEvent | kUsr | kOs | kEn; // 0x4302ce
 		}
 
 		//* One-time init: open one EXE.AMX_BUSY counter per core and take a baseline.
@@ -1331,16 +1370,43 @@ namespace Cpu {
 				Logger::debug("AMX: could not read the core pmu type, AMX monitoring disabled");
 				return;
 			}
-			const uint64_t config = amx_event_config();
+			const uint64_t reg_value = amx_event_config();
 
 			amx_fds.assign(core_count, -1);
-			int opened = 0;
-			for (int i = 0; i < core_count; ++i) {
+
+			//? Negotiate the perf config on core 0 first: use PCM's bit-63
+			//? encoding, and if the kernel rejects it fall back to the bare
+			//? register value. Both carry the USR/OS/Enable bits that make
+			//? the counter actually increment.
+			uint64_t config = (1ULL << 63ULL) | reg_value;
+			int test_fd = amx_perf_event_open(pmu_type, config, 0);
+			if (test_fd < 0) {
+				const int err = errno;
+				if (err == EPERM or err == EACCES) {
+					Logger::debug("AMX: perf_event_open denied (errno {}), AMX monitoring disabled — "
+						"raise /proc/sys/kernel/perf_event_paranoid or grant CAP_PERFMON", err);
+					shutdown_amx();
+					return;
+				}
+				config = reg_value;
+				test_fd = amx_perf_event_open(pmu_type, config, 0);
+				if (test_fd < 0) {
+					Logger::debug("AMX: perf_event_open failed (errno {}), AMX monitoring disabled", errno);
+					shutdown_amx();
+					return;
+				}
+			}
+			amx_fds[0] = test_fd;
+			Logger::debug("AMX: negotiated pmu type {}, event config 0x{:x}", pmu_type, config);
+
+			int opened = 1;
+			for (int i = 1; i < core_count; ++i) {
 				amx_fds[i] = amx_perf_event_open(pmu_type, config, i);
 				if (amx_fds[i] < 0) {
-					if (errno == EPERM or errno == EACCES) {
-						Logger::debug("AMX: perf_event_open denied (errno {}), AMX monitoring disabled — "
-							"raise /proc/sys/kernel/perf_event_paranoid or grant CAP_PERFMON", errno);
+					const int err = errno;
+					if (err == EPERM or err == EACCES) {
+						Logger::debug("AMX: perf_event_open denied on core {} (errno {}), AMX monitoring disabled",
+							i, err);
 						shutdown_amx();
 						return;
 					}
@@ -1383,9 +1449,16 @@ namespace Cpu {
 				amx_prev_counts[i] = count;
 				//? Any detected matrix instruction registers as at least 1% so short
 				//? AMX bursts do not round down to zero and hide the TUI indicators.
-				cpu.core_amx_percent[i] = (delta_amx == 0 or delta_tsc == 0)
+				const long long pct = (delta_amx == 0 or delta_tsc == 0)
 					? 0
 					: max(1ll, clamp((long long)round((double)delta_amx * 100.0 / (double)delta_tsc), 0ll, 100ll));
+				cpu.core_amx_percent[i] = pct;
+				//? One-shot confirmation that the counter is actually incrementing.
+				if (pct > 0 and not amx_activity_logged) {
+					amx_activity_logged = true;
+					Logger::debug("AMX: first activity — core {} at {}% ({} delta over {} tsc cycles)",
+						i, pct, delta_amx, delta_tsc);
+				}
 			}
 			amx_prev_tsc = tsc;
 		}
@@ -1401,6 +1474,7 @@ namespace Cpu {
 		amx_prev_counts.clear();
 		amx_prev_tsc = 0;
 		amx_init_attempted = false;
+		amx_activity_logged = false;
 		#endif
 		has_amx = false;
 	}
