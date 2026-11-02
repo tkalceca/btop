@@ -1257,8 +1257,8 @@ namespace Cpu {
 		static vector<uint64_t> amx_prev_counts = {};
 		static uint64_t amx_prev_tsc = 0;
 		static bool amx_init_attempted = false;
-		static bool amx_activity_logged = false;
-		static bool amx_first_tick_logged = false;
+		static vector<long long> amx_prev_percent = {};
+		static uint64_t amx_diag_ticks = 0;
 
 		static inline uint64_t amx_rdtsc() {
 			return __builtin_ia32_rdtsc();
@@ -1273,10 +1273,11 @@ namespace Cpu {
 		#endif
 
 		//* Open a system-wide (all processes on <cpu>) core PMU counter.
-		//* Privilege filtering is done via the USR/OS bits baked into `config`
-		//* (matching Intel PCM), so exclude_user/exclude_kernel/exclude_hv are
-		//* left cleared — otherwise the kernel would strip the OS/USR bits out
-		//* of the programmed MSR and the counter would never increment.
+		//* Userspace only supplies the event code/umask in `config`; the kernel
+		//* programs the USR/OS/Enable register bits itself. The exclude_*
+		//* filters are cleared (perf stat defaults) so both user and kernel
+		//* mode are counted — the kernel never executes AMX (a userspace-only
+		//* feature), so this adds no noise.
 		static int amx_perf_event_open(uint64_t pmu_type, uint64_t config, int cpu) {
 			struct perf_event_attr attr = {};
 			attr.type = pmu_type;
@@ -1301,17 +1302,15 @@ namespace Cpu {
 			return 0;
 		}
 
-		//* Build the IA32_PERFEVTSEL register value for EXE.AMX_BUSY, matching Intel
-		//* PCM's encoding: EventCode (bits 0-7), UMask (bits 8-15), User (bit 16),
-		//* OS (bit 17) and Enable (bit 22). Both User and OS are set so the PMU
-		//* counts in every mode — the kernel never executes AMX (a userspace-only
-		//* feature), so this adds no noise. Default (SPR/EMR) is 0x4302ce.
+		//* Build the raw perf_event_open config for EXE.AMX_BUSY:
+		//* (UMask << 8) | EventCode — 0x02ce for the canonical SPR/EMR encoding.
+		//* Userspace may only supply the event code/umask (plus edge/invert/cmask);
+		//* the USR/OS/Enable register bits are programmed by the kernel from the
+		//* (cleared) exclude_* filters — exactly what `perf stat -e r02ce` does.
+		//* Setting MSR control bits or bit 63 from userspace breaks the event.
 		static uint64_t amx_event_config() {
 			constexpr uint64_t kEvent = 0xce;
 			constexpr uint64_t kUmask = 0x02;
-			constexpr uint64_t kUsr   = 1ULL << 16;
-			constexpr uint64_t kOs    = 1ULL << 17;
-			constexpr uint64_t kEn    = 1ULL << 22;
 
 			//? Parse a hex field ("name=0x..") from the kernel's event text.
 			auto field = [](const string& s, const string& name) -> std::optional<uint64_t> {
@@ -1342,11 +1341,11 @@ namespace Cpu {
 						const auto ev = field(s, "event");
 						const auto um = field(s, "umask");
 						if (ev.has_value() or um.has_value())
-							return (um.value_or(kUmask) << 8) | (ev.value_or(kEvent) & 0xff) | kUsr | kOs | kEn;
+							return (um.value_or(kUmask) << 8) | (ev.value_or(kEvent) & 0xff);
 					}
 				} catch (const std::exception&) {}
 			}
-			return (kUmask << 8) | kEvent | kUsr | kOs | kEn; // 0x4302ce
+			return (kUmask << 8) | kEvent; // 0x02ce
 		}
 
 		//* One-time init: open one EXE.AMX_BUSY counter per core and take a baseline.
@@ -1371,27 +1370,11 @@ namespace Cpu {
 				Logger::debug("AMX: could not read the core pmu type, AMX monitoring disabled");
 				return;
 			}
-			const uint64_t reg_value = amx_event_config();
+			const uint64_t config = amx_event_config();
 
 			amx_fds.assign(core_count, -1);
-
-			//? Negotiate the perf config on core 0 first. Different kernel
-			//? versions accept different subsets of the event-select register
-			//? bits, so try three encodings in order:
-			//?   1. PCM's full encoding (bit 63 + USR/OS/Enable bits)
-			//?   2. the bare event-select register value (USR/OS/Enable bits)
-			//?   3. the plain raw event code (0x02ce) that the kernel decodes
-			//?      itself and programs USR/OS/Enable for — what
-			//?      `perf stat -e r02ce` uses on stock kernels.
-			uint64_t config = 0;
-			int test_fd = -1;
-			for (const uint64_t candidate : { (uint64_t)((1ULL << 63ULL) | reg_value), reg_value,
-					(uint64_t)(reg_value & 0xffffULL) }) {
-				test_fd = amx_perf_event_open(pmu_type, candidate, 0);
-				if (test_fd >= 0) {
-					config = candidate;
-					break;
-				}
+			int test_fd = amx_perf_event_open(pmu_type, config, 0);
+			if (test_fd < 0) {
 				const int err = errno;
 				if (err == EPERM or err == EACCES) {
 					Logger::debug("AMX: perf_event_open denied (errno {}), AMX monitoring disabled — "
@@ -1399,15 +1382,12 @@ namespace Cpu {
 					shutdown_amx();
 					return;
 				}
-			}
-			if (test_fd < 0) {
-				Logger::debug("AMX: perf_event_open rejected every event encoding (errno {}), "
-					"AMX monitoring disabled", errno);
+				Logger::debug("AMX: perf_event_open failed (errno {}), AMX monitoring disabled", err);
 				shutdown_amx();
 				return;
 			}
 			amx_fds[0] = test_fd;
-			Logger::debug("AMX: negotiated pmu type {}, event config 0x{:x}", pmu_type, config);
+			Logger::debug("AMX: pmu type {}, raw event config 0x{:x}", pmu_type, config);
 
 			int opened = 1;
 			for (int i = 1; i < core_count; ++i) {
@@ -1449,6 +1429,12 @@ namespace Cpu {
 		static void amx_update(cpu_info& cpu) {
 			const uint64_t tsc = amx_rdtsc();
 			const uint64_t delta_tsc = tsc - amx_prev_tsc;
+
+			//? Per-core activity-state tracking for transition logging.
+			if (amx_prev_percent.size() != cpu.core_amx_percent.size())
+				amx_prev_percent.assign(cpu.core_amx_percent.size(), 0);
+
+			uint64_t max_count = 0, max_core = 0;
 			for (size_t i = 0; i < amx_fds.size() and i < cpu.core_amx_percent.size(); ++i) {
 				if (amx_fds[i] < 0)
 					continue; //? core was unavailable at init — stays 0
@@ -1457,12 +1443,9 @@ namespace Cpu {
 					continue; //? e.g. core hotplugged offline mid-run — stays 0 for this tick
 				const uint64_t delta_amx = (count >= amx_prev_counts[i]) ? count - amx_prev_counts[i] : 0;
 				amx_prev_counts[i] = count;
-				//? One-shot tick-1 diagnostic: shows immediately whether the
-				//? counter is accumulating at all during remote testing.
-				if (not amx_first_tick_logged) {
-					amx_first_tick_logged = true;
-					Logger::debug("AMX: first sample core {}: count={} delta={} delta_tsc={}",
-						i, count, delta_amx, delta_tsc);
+				if (count > max_count) {
+					max_count = count;
+					max_core = i;
 				}
 				//? Any detected matrix instruction registers as at least 1% so short
 				//? AMX bursts do not round down to zero and hide the TUI indicators.
@@ -1470,12 +1453,24 @@ namespace Cpu {
 					? 0
 					: max(1ll, clamp((long long)round((double)delta_amx * 100.0 / (double)delta_tsc), 0ll, 100ll));
 				cpu.core_amx_percent[i] = pct;
-				//? One-shot confirmation that the counter is actually incrementing.
-				if (pct > 0 and not amx_activity_logged) {
-					amx_activity_logged = true;
-					Logger::debug("AMX: first activity — core {} at {}% ({} delta over {} tsc cycles)",
-						i, pct, delta_amx, delta_tsc);
+				//? Log activity state transitions (idle -> active, active -> idle)
+				//? so any core receiving the workload is visible in the log.
+				const long long prev_pct = amx_prev_percent[i];
+				amx_prev_percent[i] = pct;
+				if (prev_pct == 0 and pct > 0) {
+					Logger::debug("AMX: core {} active — count={} delta={} delta_tsc={} ({}%)",
+						i, count, delta_amx, delta_tsc, pct);
 				}
+				else if (prev_pct > 0 and pct == 0) {
+					Logger::debug("AMX: core {} idle again", i);
+				}
+			}
+			//? First few ticks: report the max raw count across all cores so a
+			//? stuck-at-zero counter is immediately visible in the log.
+			if (amx_diag_ticks < 3) {
+				++amx_diag_ticks;
+				Logger::debug("AMX: tick {}: max raw count {} on core {} ({} counters), delta_tsc={}",
+					amx_diag_ticks, max_count, max_core, amx_fds.size(), delta_tsc);
 			}
 			amx_prev_tsc = tsc;
 		}
@@ -1489,10 +1484,10 @@ namespace Cpu {
 			if (fd >= 0) ::close(fd);
 		amx_fds.clear();
 		amx_prev_counts.clear();
+		amx_prev_percent.clear();
 		amx_prev_tsc = 0;
 		amx_init_attempted = false;
-		amx_activity_logged = false;
-		amx_first_tick_logged = false;
+		amx_diag_ticks = 0;
 		#endif
 		has_amx = false;
 	}

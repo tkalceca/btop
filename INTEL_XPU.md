@@ -305,24 +305,23 @@ in the last update interval (see Measurement).
 - Acquisition: one `perf_event_open()` per (logical) core, system-wide (`pid=-1`),
   with `attr.type` read from `/sys/bus/event_source/devices/cpu/type` (falling back
   to the legacy `/sys/devices/cpu/type`) and the perf `exclude_*` filters cleared.
-  The `EventCode`/`UMask` come from a kernel-exposed named event file
+  `attr.config` is the plain raw event code `(UMask << 8) | EventCode` — the
+  `EventCode`/`UMask` come from a kernel-exposed named event file
   (`.../events/exe.amx_busy`) when present, otherwise the canonical SPR/EMR
-  encoding. Kernels differ in which bits of the `IA32_PERFEVTSEL` register they
-  accept in `attr.config`, so the config is negotiated on core 0 by trying three
-  encodings in order: (1) PCM's full form `(1<<63) | reg` with `User` (bit 16),
-  `OS` (bit 17) and `Enable` (bit 22) set — i.e. `0x80000000004302ce` by default —
-  (2) the bare register value `0x4302ce`, and (3) the plain raw event code
-  `0x02ce`, which stock kernels decode themselves and program USR/OS/Enable for
-  (the same config `perf stat -e r02ce` uses). The first encoding the kernel
-  accepts is used for all cores.
+  encoding, i.e. `0x02ce`. This is exactly what `perf stat -e r02ce` passes; the
+  kernel decodes the code and programs the `User`/`OS`/`Enable` register bits
+  itself. The MSR control bits (`User` bit 16, `OS` bit 17, `Enable` bit 22) and
+  bit 63 must **not** be set from userspace — PCM only sets them because it writes
+  the `IA32_PERFEVTSEL` MSR directly when it bypasses the perf driver; through
+  `perf_event_open` they make the kernel mis-program or reject the event (counter
+  stays at 0).
 - Per-core busy% each tick: `ΔEXE.AMX_BUSY / ΔTSC cycles × 100` (clamped to 0–100),
   with the TSC delta measured via `rdtsc` — the same arithmetic PCM uses when it
   reports this event (compare the TSC column vs. the per-core event deltas in
   `pcm-raw -tr -e EXE.AMX_BUSY` output).
-- Privilege filtering: the `User`/`OS` bits are set in the register value when the
-  kernel accepts them, and otherwise derived by the kernel from the (cleared) perf
-  `exclude_user`/`exclude_kernel`/`exclude_hv` filters — either way both user and
-  kernel mode are counted, matching PCM. The kernel never executes AMX (a
+- Privilege filtering: the perf `exclude_user`/`exclude_kernel`/`exclude_hv`
+  filters are left cleared (the `perf stat` defaults), so the kernel programs the
+  `User` and `OS` register bits for both modes. The kernel never executes AMX (a
   userspace-only feature), so counting every mode adds no noise.
 - The indicators show for **any** non-zero AMX activity in the last interval —
   matrix instructions were executing on that core, even if briefly. Any non-zero
