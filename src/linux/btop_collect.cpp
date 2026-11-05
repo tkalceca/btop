@@ -1303,13 +1303,13 @@ namespace Cpu {
 		}
 
 		//* Build the raw perf_event_open config for EXE.AMX_BUSY:
-		//* (UMask << 8) | EventCode — 0x02ce for the canonical SPR/EMR encoding.
+		//* (UMask << 8) | EventCode — 0x02b7 for the canonical encoding (SPR/EMR/GNR).
 		//* Userspace may only supply the event code/umask (plus edge/invert/cmask);
 		//* the USR/OS/Enable register bits are programmed by the kernel from the
-		//* (cleared) exclude_* filters — exactly what `perf stat -e r02ce` does.
+		//* (cleared) exclude_* filters — exactly what `perf stat -a -e r02b7` does.
 		//* Setting MSR control bits or bit 63 from userspace breaks the event.
 		static uint64_t amx_event_config() {
-			constexpr uint64_t kEvent = 0xce;
+			constexpr uint64_t kEvent = 0xb7;
 			constexpr uint64_t kUmask = 0x02;
 
 			//? Parse a hex field ("name=0x..") from the kernel's event text.
@@ -1345,7 +1345,7 @@ namespace Cpu {
 					}
 				} catch (const std::exception&) {}
 			}
-			return (kUmask << 8) | kEvent; // 0x02ce
+			return (kUmask << 8) | kEvent; // 0x02b7
 		}
 
 		//* One-time init: open one EXE.AMX_BUSY counter per core and take a baseline.

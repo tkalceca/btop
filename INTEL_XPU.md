@@ -300,15 +300,15 @@ in the last update interval (see Measurement).
 
 ### Measurement
 
-- Event: `EXE.AMX_BUSY` (EventCode `0xCE`, UMask `0x02`), which counts the cycles
+- Event: `EXE.AMX_BUSY` (EventCode `0xB7`, UMask `0x02`), which counts the cycles
   during which the TMUL units execute matrix instructions.
 - Acquisition: one `perf_event_open()` per (logical) core, system-wide (`pid=-1`),
   with `attr.type` read from `/sys/bus/event_source/devices/cpu/type` (falling back
   to the legacy `/sys/devices/cpu/type`) and the perf `exclude_*` filters cleared.
   `attr.config` is the plain raw event code `(UMask << 8) | EventCode` — the
   `EventCode`/`UMask` come from a kernel-exposed named event file
-  (`.../events/exe.amx_busy`) when present, otherwise the canonical SPR/EMR
-  encoding, i.e. `0x02ce`. This is exactly what `perf stat -e r02ce` passes; the
+  (`.../events/exe.amx_busy`) when present, otherwise the canonical SPR/EMR/GNR
+  encoding, i.e. `0x02b7`. This is exactly what `perf stat -a -e r02b7` passes; the
   kernel decodes the code and programs the `User`/`OS`/`Enable` register bits
   itself. The MSR control bits (`User` bit 16, `OS` bit 17, `Enable` bit 22) and
   bit 63 must **not** be set from userspace — PCM only sets them because it writes
