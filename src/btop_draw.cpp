@@ -419,7 +419,7 @@ namespace Draw {
 	}
 
 	//* Graph class ------------------------------------------------------------------------------------------------------------>
-	void Graph::_create(const deque<long long>& data, int data_offset, const string& gradient_override) {
+	void Graph::_create(const deque<long long>& data, int data_offset, const string& gradient_override, const deque<bool>& highlight_data) {
 		//? <gradient_override> (if given) replaces the graph's own gradient for this frame
 		const string& grad = gradient_override.empty() ? color_gradient : gradient_override;
 		bool mult = (data.size() - data_offset > 1);
@@ -443,6 +443,15 @@ namespace Draw {
 			else {
 				data_value = data.at(i);
 				if (max_value > 0) data_value = clamp((data_value + offset) * 100 / max_value, 0ll, 100ll);
+			}
+
+			//? Track per-column highlight during multi-point creation (constructor)
+			if (mult and not highlight_gradient.empty()) {
+				const bool hl = (i >= 0 and i < (int)highlight_data.size() and highlight_data[i])
+					or (i > 0 and i - 1 < (int)highlight_data.size() and highlight_data[i - 1]);
+				is_highlight.at(current).push_back(hl);
+				if (is_highlight.at(current).size() > (size_t)width)
+					is_highlight.at(current).pop_front();
 			}
 
 			//? Vertical iteration over height of graph
@@ -479,6 +488,37 @@ namespace Draw {
 			//	out += (last < 1 ? Theme::c("inactive_fg") : Theme::g(color_gradient).at(clamp(last, 0ll, 100ll)));
 			out += graphs.at(current).at(0);
 		}
+		else if (not highlight_gradient.empty() and std::ranges::any_of(is_highlight.at(current), [](bool b) { return b; })) {
+			const auto& hl_vec = is_highlight.at(current);
+			auto utf8_len = [](unsigned char c) -> size_t {
+				if (c < 0x80) return 1;
+				if ((c & 0xE0) == 0xC0) return 2;
+				if ((c & 0xF0) == 0xE0) return 3;
+				if ((c & 0xF8) == 0xF0) return 4;
+				return 1;
+			};
+			for (const int& i : iota(1, height + 1)) {
+				if (i > 1) out += Mv::d(1) + Mv::l(width);
+				const int pct = clamp((invert) ? (i * 100 / height) : (100 - ((i - 1) * 100 / height)), 0, 100);
+				const string normal_color = (not grad.empty()) ? Theme::g(grad).at(pct) : "";
+				const string hl_color = Theme::g(highlight_gradient).at(pct);
+				const string& row_str = (invert) ? graphs.at(current).at(height - i) : graphs.at(current).at(i - 1);
+
+				int cur_state = -1; // -1: none, 0: normal, 1: highlight
+				size_t pos = 0;
+				for (size_t col = 0; col < hl_vec.size() and pos < row_str.size(); ++col) {
+					const int target_state = hl_vec[col] ? 1 : 0;
+					if (target_state != cur_state) {
+						cur_state = target_state;
+						out += (cur_state == 1) ? hl_color : normal_color;
+					}
+					const size_t len = utf8_len((unsigned char)row_str[pos]);
+					out.append(row_str, pos, len);
+					pos += len;
+				}
+				if (pos < row_str.size()) out.append(row_str, pos, row_str.size() - pos);
+			}
+		}
 		else {
 			for (const int& i : iota(1, height + 1)) {
 				if (i > 1) out += Mv::d(1) + Mv::l(width);
@@ -487,15 +527,17 @@ namespace Draw {
 				out += (invert) ? graphs.at(current).at(height - i) : graphs.at(current).at(i-1);
 			}
 		}
-		if (not grad.empty()) out += Fx::reset;
+		if (not grad.empty() or not highlight_gradient.empty()) out += Fx::reset;
 	}
 
 	Graph::Graph() {}
 
 	Graph::Graph(int width, int height, const string& color_gradient,
 				 const deque<long long>& data, const string& symbol,
-				 bool invert, bool no_zero, long long max_value, long long offset)
+				 bool invert, bool no_zero, long long max_value, long long offset,
+				 const string& highlight_gradient, const deque<bool>& highlight_data)
 	: width(width), height(height), color_gradient(color_gradient),
+	  highlight_gradient(highlight_gradient),
 	  invert(invert), no_zero(no_zero), offset(offset) {
 		if (Config::getB("tty_mode") or symbol == "tty") this->symbol = "tty";
 		else if (symbol != "default") this->symbol = symbol;
@@ -516,11 +558,16 @@ namespace Draw {
 			if (tty_mode and i % 2 != current) continue;
 			graphs[(i % 2 != 0)].push_back((value_width < width) ? ((height == 1) ? Mv::r(1) : " "s) * (width - value_width) : "");
 		}
+		if (not highlight_gradient.empty()) {
+			const int pad_cols = max(0, width - value_width);
+			is_highlight[false].assign(pad_cols, false);
+			is_highlight[true].assign(pad_cols, false);
+		}
 		if (data.size() == 0) return;
-		this->_create(data, data_offset);
+		this->_create(data, data_offset, "", highlight_data);
 	}
 
-	string& Graph::operator()(const deque<long long>& data, bool data_same, const string& gradient_override) {
+	string& Graph::operator()(const deque<long long>& data, bool data_same, const string& gradient_override, bool highlight) {
 		if (data_same) return out;
 
 		//? Make room for new characters on graph
@@ -532,6 +579,12 @@ namespace Draw {
 			}
 			else if (graphs.at(current).at(i).at(0) == ' ') graphs.at(current).at(i).erase(0, 1);
 			else graphs.at(current).at(i).erase(0, 3);
+		}
+		if (not highlight_gradient.empty()) {
+			if (not is_highlight.at(current).empty())
+				is_highlight.at(current).pop_front();
+			const bool hl = highlight or (gradient_override == highlight_gradient);
+			is_highlight.at(current).push_back(hl);
 		}
 		this->_create(data, (int)data.size() - 1, gradient_override);
 		return out;
@@ -594,16 +647,14 @@ namespace Cpu {
 		//? just mean "show whenever at least one NPU was detected".
 		const bool show_npu = (npus.size() > 0 and Config::getS("show_npu_info") != "Off");
 #endif // GPU_SUPPORT
-		//* Intel AMX (TMUL) active on any core in the last interval — used to tint the
-		//* CPU graphs with the "amx" accent gradient and switch the C/A indicators.
+		//* Intel AMX (TMUL) active on any core in the last interval — used to highlight
+		//* active timeline columns with the "amx" gradient and switch the CPU meter label.
 		//* See INTEL_XPU.md.
 		#if defined(__linux__)
 		const bool amx_any_active = Cpu::has_amx and not cpu.core_amx_percent.empty()
 			and std::ranges::any_of(cpu.core_amx_percent, [](const long long& p) { return p > 0; });
-		const string amx_gradient = amx_any_active ? "amx" : "";
 		#else
 		const bool amx_any_active = false;
-		const string amx_gradient = "";
 		#endif
 		auto graph_up_field = Config::getS("cpu_graph_upper");
 		if (graph_up_field == "Auto" or not v_contains(Cpu::available_fields, graph_up_field))
@@ -741,7 +792,7 @@ namespace Cpu {
 			#endif
 					graphs.resize(1);
 					graph_width = graph_default_width;
-					graphs[0] = Draw::Graph{ graph_width, graph_height, "cpu", safeVal(cpu.cpu_percent, graph_field), graph_symbol, invert, true };
+					graphs[0] = Draw::Graph{ graph_width, graph_height, "cpu", safeVal(cpu.cpu_percent, graph_field), graph_symbol, invert, true, 0, 0, "amx", cpu.amx_history };
 			#ifdef GPU_SUPPORT
 				}
 			#endif
@@ -938,10 +989,9 @@ namespace Cpu {
 			(void)graph_height;
 			(void)graph_width;
 		#endif
-				//? <amx_gradient> tints the CPU graph with the AMX accent color while
-				//? any core has active TMUL usage; empty string keeps the default "cpu"
-				//? gradient (Graph::operator() falls back to its own gradient).
-				out += graphs[0](safeVal(cpu.cpu_percent, graph_field), (data_same or redraw), amx_gradient);
+				//? Highlight columns with active TMUL usage with the "amx" gradient,
+				//? preserving the AMX activity history in the timeline graph.
+				out += graphs[0](safeVal(cpu.cpu_percent, graph_field), (data_same or redraw), "", amx_any_active);
 		};
 
 			draw_graphs(graphs_upper, graph_up_height, graph_up_width, actual_up_field);
@@ -949,14 +999,6 @@ namespace Cpu {
 				out += Mv::to(y + graph_up_height + 1 + mid_line, x + 1);
 				draw_graphs(graphs_lower, graph_low_height, graph_low_width, actual_lo_field);
 			}
-
-			//* C/A indicator in the top-left corner of the CPU graphs: a dim "C" for
-			//* standard CPU load, a highlighted "A" while AMX (TMUL) units are active
-			//* on any core (the graphs themselves are tinted with the "amx" gradient
-			//* at the same time). See INTEL_XPU.md.
-			out += Mv::to(y + 1, x + 1)
-				+ (amx_any_active ? Theme::c("selected_bg") + Theme::c("selected_fg") + Fx::b + 'A' + Fx::reset
-								  : Theme::c("inactive_fg") + 'C');
 
 			//? Uptime
 			if (Config::getB("show_uptime")) {

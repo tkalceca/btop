@@ -286,11 +286,12 @@ CPU box:
   numbers, the core number itself becomes a **high-contrast inverted badge**
   (`selected_bg` + `selected_fg`, bold — the same combo btop uses for selected
   menu items), so it stands out even in a dense 192-core grid.
-- **CPU graphs over time** — while *any* core has active AMX usage, the CPU
-  utilization graphs are tinted with a dedicated **"amx" accent gradient**
-  (solid `hi_fg` color by default, overridable per theme via the `amx_start`
-  color), and a small **"C" / "A"** indicator in the top-left corner of the graph
-  area switches from a dim `C` (standard CPU load) to a highlighted `A`.
+- **CPU graphs over time** — periods with active AMX usage on any core are tinted
+  with a dedicated **"amx" accent gradient** (solid `hi_fg` color by default,
+  overridable per theme via the `amx_start` color) on those specific timeline
+  columns. This preserves the AMX execution history: as time advances, the
+  highlighted AMX burst scrolls backwards through history while periods of normal
+  CPU execution remain in standard CPU theme colors.
 - **CPU meter label** — the `"CPU "` label in front of the total meter bar switches
   to a highlighted `"AMX "` while any core has active TMUL usage (same width, no
   meter shift).
@@ -359,10 +360,11 @@ core(s)` at info level on startup.
   degrades gracefully when the hardware/kernel doesn't cooperate.
 - The PMU event is per *logical* CPU, so SMT siblings are monitored independently
   (one counter per logical core, matching how the rest of the CPU box works).
-- Only a per-core boolean-ish "busy in last interval" is stored
-  (`cpu_info::core_amx_percent`); no AMX-specific history is kept, keeping the tick
-  cheap (one `read()` per core + one `rdtsc`). The graph tinting reuses the
-  existing CPU utilization history and only switches its gradient per frame.
+- Per-core AMX busy percentage is stored in `cpu_info::core_amx_percent`, and a
+  timeline history deque (`cpu_info::amx_history`) tracks active AMX intervals
+  alongside `cpu_percent.at("total")`. The CPU graph renders AMX-active columns
+  with the "amx" gradient while non-AMX periods retain the base "cpu" gradient,
+  allowing historical AMX bursts to remain visually distinct as they scroll.
 - The AMX accent color is a regular theme color: themes can set `amx_start`
   (e.g. `[amx_start] = "#ff00ff"`) to change the graph tint / badge accent. When a
   theme does not define it, it falls back to the theme's `hi_fg` value.

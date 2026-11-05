@@ -104,18 +104,18 @@ namespace Draw {
 	class Graph {
 		int width, height;
 		string color_gradient;
+		string highlight_gradient;
 		string out, symbol = "default";
 		bool invert, no_zero;
 		long long offset;
 		long long last = 0, max_value = 0;
 		bool current = true, tty_mode = false;
 		std::unordered_map<bool, vector<string>> graphs = { {true, {}}, {false, {}}};
+		std::unordered_map<bool, deque<bool>> is_highlight = { {true, {}}, {false, {}}};
 
 		//* Create two representations of the graph to switch between to represent two values for each braille character
-		//* <gradient_override> (optional) replaces the graph's own color_gradient for this
-		//* frame only, e.g. to tint the CPU graphs with the AMX accent color while
-		//* AMX (TMUL) units are active. See INTEL_XPU.md.
-		void _create(const deque<long long>& data, int data_offset, const string& gradient_override="");
+		//* <gradient_override> (optional) replaces the graph's own color_gradient for this frame.
+		void _create(const deque<long long>& data, int data_offset, const string& gradient_override="", const deque<bool>& highlight_data={});
 
 	public:
 		Graph();
@@ -124,10 +124,13 @@ namespace Draw {
 			const deque<long long>& data,
 			const string& symbol="default",
 			bool invert=false, bool no_zero=false,
-			long long max_value=0, long long offset=0);
+			long long max_value=0, long long offset=0,
+			const string& highlight_gradient="",
+			const deque<bool>& highlight_data={});
 
 		//* Add last value from back of <data> and return string representation of graph
-		string& operator()(const deque<long long>& data, bool data_same=false, const string& gradient_override="");
+		//* <highlight> flags the newest column with <highlight_gradient> (e.g. AMX active).
+		string& operator()(const deque<long long>& data, bool data_same=false, const string& gradient_override="", bool highlight=false);
 
 		//* Return string representation of graph
 		string& operator()();

@@ -257,6 +257,8 @@ namespace Cpu {
 		//* Per-core AMX (TMUL matrix accelerator) busy percentage, valid (and
 		//* indexed like core_percent) only when has_amx is true. See INTEL_XPU.md.
 		vector<long long> core_amx_percent;
+		//* Timeline history of whether AMX was active on any core (aligned with cpu_percent.at("total")).
+		deque<bool> amx_history;
 		vector<deque<long long>> temp;
 		long long temp_max = 0;
 		array<double, 3> load_avg;

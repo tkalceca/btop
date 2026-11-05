@@ -1648,6 +1648,14 @@ namespace Cpu {
 		}
 		#endif
 
+		const bool amx_now = has_amx and not cpu.core_amx_percent.empty()
+			and std::ranges::any_of(cpu.core_amx_percent, [](const long long& p) { return p > 0; });
+		cpu.amx_history.push_back(amx_now);
+		while (cpu.amx_history.size() < cpu.cpu_percent.at("total").size())
+			cpu.amx_history.push_front(false);
+		while (cmp_greater(cpu.amx_history.size(), cpu.cpu_percent.at("total").size()))
+			cpu.amx_history.pop_front();
+
 		cpu.active_cpus = std::make_optional(detect_active_cpus());
 
 		return cpu;
