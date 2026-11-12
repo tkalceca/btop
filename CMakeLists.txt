@@ -32,6 +32,13 @@ option(BTOP_STATIC "Link btop statically" OFF)
 option(BTOP_GPU "Enable GPU support" ON)
 cmake_dependent_option(BTOP_RSMI_STATIC "Link statically to ROCm SMI" OFF "BTOP_GPU" OFF)
 
+if(DEFINED BTOP_USE_LEVELZERO AND NOT DEFINED USE_LEVELZERO)
+  set(USE_LEVELZERO ${BTOP_USE_LEVELZERO} CACHE BOOL "Enable Intel Level Zero GPU telemetry backend")
+elseif(DEFINED BTOP_LEVELZERO AND NOT DEFINED USE_LEVELZERO)
+  set(USE_LEVELZERO ${BTOP_LEVELZERO} CACHE BOOL "Enable Intel Level Zero GPU telemetry backend")
+endif()
+cmake_dependent_option(USE_LEVELZERO "Enable Intel Level Zero GPU telemetry backend" ON "BTOP_GPU;LINUX" OFF)
+
 # Enable LTO in release builds by default
 if(CMAKE_BUILD_TYPE MATCHES "Rel(ease|WithDebInfo)")
   option(BTOP_LTO "Enable LTO" ON)
@@ -90,7 +97,7 @@ execute_process(
   OUTPUT_VARIABLE GIT_COMMIT
   OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
 set(CONFIGURE_COMMAND
-    "cmake -DBTOP_STATIC=${BTOP_STATIC} -DBTOP_GPU=${BTOP_GPU}"
+    "cmake -DBTOP_STATIC=${BTOP_STATIC} -DBTOP_GPU=${BTOP_GPU} -DUSE_LEVELZERO=${USE_LEVELZERO}"
 )
 get_filename_component(CXX_COMPILER_BASENAME "${CMAKE_CXX_COMPILER}" NAME)
 set(COMPILER "${CXX_COMPILER_BASENAME}")
@@ -163,6 +170,49 @@ target_link_libraries(libbtop Threads::Threads)
 # Enable GPU support
 if(LINUX AND BTOP_GPU)
   target_compile_definitions(libbtop PUBLIC GPU_SUPPORT)
+
+  if(USE_LEVELZERO)
+    set(CMAKE_REQUIRED_QUIET TRUE)
+    check_cxx_source_compiles(
+      "
+      #include <level_zero/zes_api.h>
+      int main() { return 0; }
+      "
+      HAS_LEVEL_ZERO
+    )
+    if(NOT HAS_LEVEL_ZERO)
+      # Try looking in common oneAPI or alternate paths
+      find_path(LEVEL_ZERO_INCLUDE_DIR NAMES level_zero/zes_api.h
+        PATHS
+          /opt/intel/oneapi/level-zero/latest/include
+          $ENV{ONEAPI_ROOT}/include
+      )
+      if(LEVEL_ZERO_INCLUDE_DIR)
+        set(CMAKE_REQUIRED_INCLUDES ${LEVEL_ZERO_INCLUDE_DIR})
+        check_cxx_source_compiles(
+          "
+          #include <level_zero/zes_api.h>
+          int main() { return 0; }
+          "
+          HAS_LEVEL_ZERO_CUSTOM
+        )
+        if(HAS_LEVEL_ZERO_CUSTOM)
+          set(HAS_LEVEL_ZERO TRUE)
+          target_include_directories(libbtop SYSTEM PUBLIC ${LEVEL_ZERO_INCLUDE_DIR})
+        endif()
+        unset(CMAKE_REQUIRED_INCLUDES)
+      endif()
+    endif()
+
+    if(NOT HAS_LEVEL_ZERO)
+      message(FATAL_ERROR
+        "Level Zero headers (<level_zero/zes_api.h>) were requested (USE_LEVELZERO=ON) but could not be compiled.\n"
+        "Please install libze-dev (Ubuntu/Debian), level-zero (Alpine), or oneapi-level-zero-devel (Fedora).\n"
+        "Or disable Level Zero support by configuring with -DUSE_LEVELZERO=OFF."
+      )
+    endif()
+    target_compile_definitions(libbtop PUBLIC USE_LEVELZERO)
+  endif()
 
   if(BTOP_RSMI_STATIC)
     # ROCm doesn't properly add it's folders to the module path if `CMAKE_MODULE_PATH` is already

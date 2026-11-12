@@ -113,6 +113,20 @@ ifeq ($(GPU_SUPPORT),true)
 	endif
 endif
 
+#? Level Zero Support (Intel GPU)
+ifeq ($(PLATFORM_LC)$(ARCH),linuxx86_64)
+	ifeq ($(GPU_SUPPORT),true)
+		USE_LEVELZERO ?= true
+	endif
+endif
+ifneq ($(USE_LEVELZERO),true)
+	USE_LEVELZERO := false
+endif
+
+ifeq ($(USE_LEVELZERO),true)
+	override ADDFLAGS += -DUSE_LEVELZERO
+endif
+
 #? Compiler and Linker
 ifeq ($(shell $(CXX) --version | grep clang >/dev/null 2>&1; echo $$?),0)
 	override CXX_IS_CLANG := true
@@ -293,6 +307,7 @@ info:
 	@$(call green  ,PLATFORM     $(YELLOW)?| ,$(PLATFORM))
 	@$(call cyan   ,ARCH         $(YELLOW)?| ,$(ARCH))
 	@$(call magenta,GPU_SUPPORT  $(BLUE):| ,$(GPU_SUPPORT))
+	@$(call magenta,USE_LEVELZERO$(BLUE):| ,$(USE_LEVELZERO))
 	@$(call yellow ,CXX          ?| ,$(CXX) $(B_YELLOW)($(WHITE)$(CXX_VERSION)$(YELLOW)))
 	@$(SHOW_CC_INFO) || \
 	 $(call yellow ,CC           ?| ,$(CC) $(B_YELLOW)($(WHITE)$(CC_VERSION)$(YELLOW)))

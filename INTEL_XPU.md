@@ -9,18 +9,21 @@ sudo apt update
 sudo apt install gcc-14 g++-14 -y
 sudo apt install cmake ninja-build lowdown -y
 
-# CPU Only
+# Without Level Zero (Intel GPU sysfs fallback, NPU, AMD, and NVIDIA remain enabled)
 cmake -B build -G Ninja \
 -DUSE_LEVELZERO=OFF \
 -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_C_COMPILER=gcc-14 \
 -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
 
-# XPU
+# CPU Only (disables all GPU monitoring)
+# cmake -B build -G Ninja -DBTOP_GPU=OFF ...
+
+# XPU (with Level Zero)
 # PLEASE FOLLOW:
 # https://dgpu-docs.intel.com/installation-guides/installing-packages-from-the-intel-ppa.html
 sudo apt install libze-dev
-# This should automatically use -DUSE_LEVELZERO=ON (level-zero required!)
-# otherwise, switch it off via -DUSE_LEVELZERO=OFF (not verified)
+# Defaults to -DUSE_LEVELZERO=ON (requires Level Zero headers)
+# Otherwise, switch it off via -DUSE_LEVELZERO=OFF
 cmake -B build -G Ninja \
 -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_C_COMPILER=gcc-14 \
 -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
@@ -181,7 +184,7 @@ Fixed by:
 runtime via `dlopen`). This follows the exact precedent `Rsmi` already sets for
 `<rocm_smi/rocm_smi.h>` in its static-linking mode.
 
-Install the relevant package before building with `GPU_SUPPORT=true` (or `-DBTOP_GPU=ON`):
+Install the relevant package before building with `GPU_SUPPORT=true` (or `-DBTOP_GPU=ON`), or disable Level Zero via `-DUSE_LEVELZERO=OFF` (or `make USE_LEVELZERO=false`), which falls back cleanly to the sysfs and PMU Intel GPU backends without requiring Level Zero headers:
 
 | Distro | Package |
 |---|---|

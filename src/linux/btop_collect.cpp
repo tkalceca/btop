@@ -83,7 +83,9 @@ extern "C" {
 	//? dlopen'd at runtime (see Gpu::Intel::LevelZero::init()), so this is a build-time-only
 	//? dependency, same trade-off Rsmi already accepts for <rocm_smi/rocm_smi.h>. See
 	//? INTEL_XPU.md for the package needed on each distro.
+#if defined(USE_LEVELZERO)
 	#include <level_zero/zes_api.h>
+#endif
 #endif
 
 using std::abs;
@@ -346,6 +348,7 @@ namespace Gpu {
 		//? when libze_loader is present on the system; dlopen'd at runtime, so this is
 		//? gracefully skipped if it isn't installed. See INTEL_XPU.md.
 		namespace LevelZero {
+#if defined(USE_LEVELZERO)
 			struct engine_info {
 				zes_engine_handle_t handle;
 				zes_engine_group_t type;
@@ -377,6 +380,12 @@ namespace Gpu {
 			template <bool is_init> bool collect(gpu_info* gpus_slice);
 			uint32_t device_count = 0;
 			void* ze_dl_handle = nullptr;
+#else
+			inline bool init() { return false; }
+			bool shutdown();
+			template <bool is_init> inline bool collect(gpu_info*) { return false; }
+			inline constexpr uint32_t device_count = 0;
+#endif
 		}
 	}
 
@@ -2795,6 +2804,7 @@ namespace Gpu {
 		template bool collect<1>(gpu_info*);
 	}
 
+#if defined(USE_LEVELZERO)
 	namespace Intel::LevelZero {
 		//? Function pointers, dlsym'd at runtime — Level Zero is optional and not everyone
 		//? has libze_loader installed, so this mirrors how Nvml/Rsmi are loaded dynamically.
@@ -3215,6 +3225,11 @@ namespace Gpu {
 		template bool collect<0>(gpu_info*);
 		template bool collect<1>(gpu_info*);
 	}
+#else
+	namespace Intel::LevelZero {
+		bool shutdown() { return false; }
+	}
+#endif
 
 	namespace Asysfs {
 		//? Read a sysfs node containing a single integer; return fallback on missing/parse error.
